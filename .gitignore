@@ -1,0 +1,18 @@
+# Challenge data and generated artifacts must remain local.
+dataset/
+working/
+artifacts/
+checkpoints/
+
+# Python caches and local environments.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local notebook/runtime metadata.
+.ipynb_checkpoints/
+kaggle.json
+.env
+
