@@ -130,9 +130,18 @@ def candidate_pairs(candidates: dict[str, str]) -> list[tuple[int, int]]:
 def locate_data_dir(requested: Path) -> Path:
     if (requested / "train.csv").is_file() and (requested / "test.csv").is_file():
         return requested
-    candidates = [Path("dataset"), Path("input"), Path("/kaggle/working/dataset")]
-    candidates.extend(Path("/kaggle/input").glob("*")) if Path("/kaggle/input").exists() else None
-    matches = [path for path in candidates if (path / "train.csv").is_file() and (path / "test.csv").is_file()]
+    roots = [Path("dataset"), Path("input"), Path("/kaggle/input"), Path("/kaggle/working/dataset")]
+    matches: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        if (root / "train.csv").is_file() and (root / "test.csv").is_file():
+            matches.append(root)
+        if root == Path("/kaggle/input"):
+            for train_path in root.rglob("train.csv"):
+                if (train_path.parent / "test.csv").is_file():
+                    matches.append(train_path.parent)
+    matches = list(dict.fromkeys(path.resolve() for path in matches))
     if len(matches) != 1:
         raise FileNotFoundError(
             f"Could not uniquely locate train.csv and test.csv; pass --data-dir. Found: {matches}"
