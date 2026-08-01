@@ -190,6 +190,7 @@ class EncodedRow:
     candidate_texts: list[str]
     candidate_bytes: list[list[int]]
     lexical_features: list[list[list[float]]]
+    bridge_prior: list[list[float]]
     pairs: list[tuple[int, int]]
     targets: list[int] | None
     originals: list[float] | None
@@ -240,6 +241,14 @@ def lexical_pair_features(left: str, right: str, candidate: str) -> list[float]:
     ]
 
 
+def character_bridge_prior(left: str, right: str, candidate: str) -> float:
+    context = re.sub(r"\s+", " ", f"{left} {right}".lower())
+    sentence = re.sub(r"\s+", " ", candidate.lower())
+    context_ngrams = {context[index : index + 5] for index in range(max(0, len(context) - 4))}
+    sentence_ngrams = {sentence[index : index + 5] for index in range(max(0, len(sentence) - 4))}
+    return len(context_ngrams & sentence_ngrams) / max(1, len(sentence_ngrams))
+
+
 def encode_frame(frame: pd.DataFrame, vocabulary: dict[str, int], labelled: bool) -> list[EncodedRow]:
     encoded: list[EncodedRow] = []
     for row in frame.itertuples(index=False):
@@ -257,6 +266,10 @@ def encode_frame(frame: pd.DataFrame, vocabulary: dict[str, int], labelled: bool
         candidate_byte_ids = [encode_bytes(parsed[letter]) for letter in LETTERS]
         lexical = [
             [lexical_pair_features(left, right, parsed[letter]) for letter in LETTERS]
+            for left, right in gap_texts
+        ]
+        bridge_prior = [
+            [character_bridge_prior(left, right, parsed[letter]) for letter in LETTERS]
             for left, right in gap_texts
         ]
         targets: list[int] | None = None
@@ -277,6 +290,7 @@ def encode_frame(frame: pd.DataFrame, vocabulary: dict[str, int], labelled: bool
                 candidate_texts=candidate_texts,
                 candidate_bytes=candidate_byte_ids,
                 lexical_features=lexical,
+                bridge_prior=bridge_prior,
                 pairs=candidate_pairs(parsed),
                 targets=targets,
                 originals=originals,
@@ -847,11 +861,11 @@ def fit_raw_count_originality(
         texts.extend(row.candidate_texts)
         labels.extend(row.originals)
     vectorizer = CountVectorizer(
-        ngram_range=(2, 4),
+        analyzer="char",
+        ngram_range=(3, 7),
         min_df=2,
         max_features=300_000,
         binary=True,
-        token_pattern=r"(?u)\b\w[\w']+\b",
         dtype=np.float32,
     )
     matrix = vectorizer.fit_transform(texts)
@@ -1312,6 +1326,7 @@ def decode_row(
     originality_weight: float,
     ngram_originality: np.ndarray | None = None,
     ngram_weight: float = 0.0,
+    bridge_weight: float = 0.0,
 ) -> list[int]:
     # Average the auxiliary signal across gaps so that it reflects sentence
     # fluency rather than accidental compatibility with one context.
@@ -1319,7 +1334,11 @@ def decode_row(
     stable_originality = originality_weight * stable_originality
     if ngram_originality is not None:
         stable_originality = stable_originality + ngram_weight * ngram_originality
-    scores = compatibility + stable_originality[None, :]
+    scores = (
+        compatibility
+        + stable_originality[None, :]
+        + bridge_weight * np.asarray(row.bridge_prior, dtype=np.float32)
+    )
     best_score = -float("inf")
     best_assignment: list[int] | None = None
     # Exactly one member of every same-token pair, with the three selected
@@ -1372,26 +1391,30 @@ def tune_and_evaluate(
     ngram_originality: np.ndarray | None = None,
 ) -> dict[str, float]:
     best: dict[str, float] | None = None
-    originality_weights = (0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0)
-    ngram_weights = (0.0,) if ngram_originality is None else (0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+    originality_weights = (0.0, 1.0, 2.0, 4.0, 8.0)
+    ngram_weights = (0.0,) if ngram_originality is None else (0.0, 0.1, 0.25, 0.5, 1.0)
+    bridge_weights = (0.0, 1.0, 2.0, 4.0, 8.0, 16.0)
     for weight in originality_weights:
         for ngram_weight in ngram_weights:
-            predictions = [
-                decode_row(
-                    rows[int(row_index)],
-                    compatibility[position],
-                    originality[position],
-                    float(weight),
-                    None if ngram_originality is None else ngram_originality[position],
-                    float(ngram_weight),
-                )
-                for position, row_index in enumerate(indices)
-            ]
-            details = evaluate_predictions(rows, indices, predictions)
-            details["originality_weight"] = float(weight)
-            details["ngram_weight"] = float(ngram_weight)
-            if best is None or details["meridian"] > best["meridian"]:
-                best = details
+            for bridge_weight in bridge_weights:
+                predictions = [
+                    decode_row(
+                        rows[int(row_index)],
+                        compatibility[position],
+                        originality[position],
+                        float(weight),
+                        None if ngram_originality is None else ngram_originality[position],
+                        float(ngram_weight),
+                        float(bridge_weight),
+                    )
+                    for position, row_index in enumerate(indices)
+                ]
+                details = evaluate_predictions(rows, indices, predictions)
+                details["originality_weight"] = float(weight)
+                details["ngram_weight"] = float(ngram_weight)
+                details["bridge_weight"] = float(bridge_weight)
+                if best is None or details["meridian"] > best["meridian"]:
+                    best = details
     assert best is not None
     return best
 
@@ -1463,6 +1486,7 @@ def write_submission(
     originality_weight: float,
     ngram_originality: np.ndarray | None = None,
     ngram_weight: float = 0.0,
+    bridge_weight: float = 0.0,
 ) -> None:
     bindings: list[str] = []
     for position, row in enumerate(rows):
@@ -1473,6 +1497,7 @@ def write_submission(
             originality_weight,
             None if ngram_originality is None else ngram_originality[position],
             ngram_weight,
+            bridge_weight,
         )
         bindings.append(">".join(LETTERS[index] for index in assignment))
     submission = pd.DataFrame({"id": [row.row_id for row in rows], "binding": bindings})
@@ -1581,6 +1606,7 @@ def run_scratch_bert(
         args.originality_weight,
         test_ngram,
         args.ngram_weight,
+        args.bridge_weight,
     )
     print(json.dumps({"submission": str(args.output), "rows": len(test_frame)}), flush=True)
 
@@ -1597,6 +1623,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--originality-weight", type=float, default=1.0)
     parser.add_argument("--ngram-weight", type=float, default=0.5)
+    parser.add_argument("--bridge-weight", type=float, default=4.0)
     parser.add_argument("--mlm-epochs", type=int, default=Config.mlm_epochs)
     return parser.parse_args()
 
@@ -1667,6 +1694,7 @@ def main() -> None:
         args.originality_weight,
         test_ngram,
         args.ngram_weight,
+        args.bridge_weight,
     )
     print(json.dumps({"submission": str(args.output), "rows": len(test_rows)}))
 
