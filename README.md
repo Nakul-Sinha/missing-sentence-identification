@@ -38,18 +38,15 @@ scratch on the supplied challenge data.
 
 ## Run
 
-The challenge data is intentionally excluded from version control. With
-`train.csv` and `test.csv` under `dataset/`, run:
+The platform supplies the public-data directory and submission output path as
+two positional arguments. Run:
 
 ```bash
-python solution.py
+python3 solution.py <public_dir> <submission_out>
 ```
 
-The default T4 configuration trains two seeded models and writes exactly:
-
-```text
-working/submission.csv
-```
+The script reads `<public_dir>/train.csv` and `<public_dir>/test.csv`, creates
+the parent directory for `<submission_out>`, and writes the CSV exactly there.
 
 The final offline Kaggle T4 production run completed in 1,336 seconds
 (approximately 22.3 minutes), including full test scoring.
@@ -57,5 +54,5 @@ The final offline Kaggle T4 production run completed in 1,336 seconds
 For the leakage-safe validation used above:
 
 ```bash
-python solution.py validate --ensemble 1
+python solution.py dataset/public working/validation.csv --mode validate --ensemble 1
 ```
