@@ -54,6 +54,7 @@ class Config:
     left_tokens: int = 64
     candidate_tokens: int = 72
     right_tokens: int = 64
+    candidate_bytes: int = 384
     d_model: int = 192
     heads: int = 6
     layers: int = 4
@@ -173,6 +174,8 @@ class EncodedRow:
     left: list[list[int]]
     right: list[list[int]]
     candidates: list[list[int]]
+    candidate_bytes: list[list[int]]
+    lexical_features: list[list[list[float]]]
     pairs: list[tuple[int, int]]
     targets: list[int] | None
     originals: list[float] | None
@@ -182,17 +185,65 @@ def encode_text(text: str, vocabulary: dict[str, int]) -> list[int]:
     return [vocabulary.get(token, UNK) for token in tokenize(text)]
 
 
+def encode_bytes(text: str) -> list[int]:
+    # Zero is padding; raw UTF-8 bytes are shifted into 1..256.  This stateless
+    # representation handles unseen names and archaic spelling without fitting
+    # anything on test text.
+    return [value + 1 for value in str(text).encode("utf-8", errors="replace")]
+
+
+def lexical_pair_features(left: str, right: str, candidate: str) -> list[float]:
+    """Stateless, non-TF-IDF cohesion features for one gap/candidate pair."""
+    def words(value: str) -> list[str]:
+        return [token.lower().replace("’", "'") for token in WORD_RE.findall(value)]
+
+    candidate_words = words(candidate)
+    left_words = words(left)
+    right_words = words(right)
+    candidate_set = set(candidate_words)
+    left_set = set(left_words)
+    right_set = set(right_words)
+    context_set = left_set | right_set
+    content_set = {token for token in candidate_set if len(token) >= 4}
+    context_content = {token for token in context_set if len(token) >= 4}
+    candidate_caps = set(re.findall(r"\b[A-Z][A-Za-z'’]{2,}\b", candidate))
+    context_caps = set(re.findall(r"\b[A-Z][A-Za-z'’]{2,}\b", f"{left} {right}"))
+    denominator = max(1, len(candidate_set))
+    content_denominator = max(1, len(content_set))
+    return [
+        math.log1p(len(candidate_words)) / 5.0,
+        len(candidate_set & context_set) / denominator,
+        len(candidate_set & left_set) / denominator,
+        len(candidate_set & right_set) / denominator,
+        len(content_set & context_content) / content_denominator,
+        math.log1p(len(candidate_caps & context_caps)) / 3.0,
+        float(candidate.lstrip().startswith(('"', "'", '“'))),
+        float(candidate.rstrip().endswith(('"', "'", '”'))),
+        float(left.rstrip().endswith(('"', "'", '”'))),
+        float(right.lstrip().startswith(('"', "'", '“'))),
+        float(bool(candidate_words) and candidate_words[0] in right_set),
+        float(bool(candidate_words) and candidate_words[-1] in left_set),
+    ]
+
+
 def encode_frame(frame: pd.DataFrame, vocabulary: dict[str, int], labelled: bool) -> list[EncodedRow]:
     encoded: list[EncodedRow] = []
     for row in frame.itertuples(index=False):
         parsed = parse_candidates(row.candidates)
         left_parts: list[list[int]] = []
         right_parts: list[list[int]] = []
+        gap_texts: list[tuple[str, str]] = []
         for gap_index in range(1, 4):
             left, right = split_gap(getattr(row, f"gap_{gap_index}"))
+            gap_texts.append((left, right))
             left_parts.append(encode_text(left, vocabulary))
             right_parts.append(encode_text(right, vocabulary))
         candidate_ids = [encode_text(parsed[letter], vocabulary) for letter in LETTERS]
+        candidate_byte_ids = [encode_bytes(parsed[letter]) for letter in LETTERS]
+        lexical = [
+            [lexical_pair_features(left, right, parsed[letter]) for letter in LETTERS]
+            for left, right in gap_texts
+        ]
         targets: list[int] | None = None
         originals: list[float] | None = None
         if labelled:
@@ -208,6 +259,8 @@ def encode_frame(frame: pd.DataFrame, vocabulary: dict[str, int], labelled: bool
                 left=left_parts,
                 right=right_parts,
                 candidates=candidate_ids,
+                candidate_bytes=candidate_byte_ids,
+                lexical_features=lexical,
                 pairs=candidate_pairs(parsed),
                 targets=targets,
                 originals=originals,
@@ -225,6 +278,83 @@ class GapDataset(Dataset[tuple[int, int]]):
 
     def __getitem__(self, index: int) -> tuple[int, int]:
         return self.items[index]
+
+
+class RowDataset(Dataset[int]):
+    def __init__(self, row_indices: Sequence[int]):
+        self.items = [int(row_index) for row_index in row_indices]
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, index: int) -> int:
+        return self.items[index]
+
+
+class RowBatchBuilder:
+    """Encode each context and candidate once per row, not once per pairing."""
+
+    def __init__(self, rows: list[EncodedRow], config: Config, labelled: bool):
+        self.rows = rows
+        self.config = config
+        self.labelled = labelled
+
+    @staticmethod
+    def _pad(sequences: list[list[int]], limit: int) -> tuple[torch.Tensor, torch.Tensor]:
+        max_length = min(limit, max(len(sequence) for sequence in sequences))
+        ids = torch.full((len(sequences), max_length), PAD, dtype=torch.long)
+        mask = torch.zeros((len(sequences), max_length), dtype=torch.bool)
+        for index, sequence in enumerate(sequences):
+            length = min(len(sequence), max_length)
+            ids[index, :length] = torch.tensor(sequence[:length], dtype=torch.long)
+            mask[index, :length] = True
+        return ids, mask
+
+    def __call__(self, row_indices: Sequence[int]) -> dict[str, torch.Tensor]:
+        batch_rows = [self.rows[int(row_index)] for row_index in row_indices]
+        candidate_sequences = [
+            candidate[: self.config.candidate_tokens]
+            for row in batch_rows
+            for candidate in row.candidates
+        ]
+        left_sequences = [
+            context[-self.config.left_tokens :]
+            for row in batch_rows
+            for context in row.left
+        ]
+        right_sequences = [
+            context[: self.config.right_tokens]
+            for row in batch_rows
+            for context in row.right
+        ]
+        candidate_ids, candidate_mask = self._pad(candidate_sequences, self.config.candidate_tokens)
+        left_ids, left_mask = self._pad(left_sequences, self.config.left_tokens)
+        right_ids, right_mask = self._pad(right_sequences, self.config.right_tokens)
+        byte_sequences = [
+            candidate[: self.config.candidate_bytes]
+            for row in batch_rows
+            for candidate in row.candidate_bytes
+        ]
+        byte_ids, byte_mask = self._pad(byte_sequences, self.config.candidate_bytes)
+        batch_size = len(batch_rows)
+        result = {
+            "candidate_ids": candidate_ids.view(batch_size, 6, -1),
+            "candidate_mask": candidate_mask.view(batch_size, 6, -1),
+            "left_ids": left_ids.view(batch_size, 3, -1),
+            "left_mask": left_mask.view(batch_size, 3, -1),
+            "right_ids": right_ids.view(batch_size, 3, -1),
+            "right_mask": right_mask.view(batch_size, 3, -1),
+            "byte_ids": byte_ids.view(batch_size, 6, -1),
+            "byte_mask": byte_mask.view(batch_size, 6, -1),
+            "lexical_features": torch.tensor(
+                [row.lexical_features for row in batch_rows], dtype=torch.float32
+            ),
+            "row_indices": torch.tensor(row_indices, dtype=torch.long),
+        }
+        if self.labelled:
+            result["targets"] = torch.tensor([row.targets for row in batch_rows], dtype=torch.long)
+            result["originals"] = torch.tensor([row.originals for row in batch_rows], dtype=torch.float32)
+        return result
 
 
 class BatchBuilder:
@@ -382,6 +512,120 @@ class CoherenceTransformer(nn.Module):
         return compatibility, originality
 
 
+class HybridCoherenceModel(nn.Module):
+    """Hierarchical word-sequence matcher plus byte-level fluency detector."""
+
+    def __init__(self, vocabulary_size: int, config: Config):
+        super().__init__()
+        self.config = config
+        self.word_embedding = nn.Embedding(vocabulary_size, config.d_model, padding_idx=PAD)
+        self.word_encoder = nn.GRU(
+            input_size=config.d_model,
+            hidden_size=config.d_model // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.word_projection = nn.Sequential(
+            nn.LayerNorm(config.d_model * 4),
+            nn.Linear(config.d_model * 4, config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+        )
+        self.byte_embedding = nn.Embedding(257, 32, padding_idx=0)
+        self.byte_convolutions = nn.ModuleList(
+            [nn.Conv1d(32, 64, kernel_size=kernel, bias=False) for kernel in (2, 3, 4, 5, 7)]
+        )
+        self.byte_projection = nn.Sequential(
+            nn.LayerNorm(64 * len(self.byte_convolutions)),
+            nn.Linear(64 * len(self.byte_convolutions), config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+        )
+        self.candidate_norm = nn.LayerNorm(config.d_model)
+        lexical_size = 12
+        compatibility_size = config.d_model * 7 + lexical_size
+        self.compatibility_head = nn.Sequential(
+            nn.LayerNorm(compatibility_size),
+            nn.Linear(compatibility_size, config.d_model * 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model * 2, 1),
+        )
+        self.originality_head = nn.Sequential(
+            nn.LayerNorm(config.d_model * 3),
+            nn.Linear(config.d_model * 3, config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model, 1),
+        )
+        self.apply(CoherenceTransformer._initialize)
+
+    def encode_words(self, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        original_shape = ids.shape[:-1]
+        flat_ids = ids.reshape(-1, ids.shape[-1])
+        flat_mask = mask.reshape(-1, mask.shape[-1])
+        embedded = self.word_embedding(flat_ids)
+        output, _ = self.word_encoder(embedded)
+        weights = flat_mask.unsqueeze(-1).to(output.dtype)
+        mean_pool = (output * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        max_pool = output.masked_fill(~flat_mask.unsqueeze(-1), -1e4).max(dim=1).values
+        first_pool = output[:, 0]
+        lengths = flat_mask.sum(dim=1).clamp_min(1)
+        last_pool = output[torch.arange(output.shape[0], device=output.device), lengths - 1]
+        vector = self.word_projection(torch.cat([mean_pool, max_pool, first_pool, last_pool], dim=-1))
+        return vector.view(*original_shape, -1)
+
+    def encode_bytes(self, ids: torch.Tensor) -> torch.Tensor:
+        original_shape = ids.shape[:-1]
+        embedded = self.byte_embedding(ids.reshape(-1, ids.shape[-1])).transpose(1, 2)
+        pooled = [F.relu(convolution(embedded)).amax(dim=-1) for convolution in self.byte_convolutions]
+        vector = self.byte_projection(torch.cat(pooled, dim=-1))
+        return vector.view(*original_shape, -1)
+
+    def forward(
+        self,
+        candidate_ids: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        left_ids: torch.Tensor,
+        left_mask: torch.Tensor,
+        right_ids: torch.Tensor,
+        right_mask: torch.Tensor,
+        byte_ids: torch.Tensor,
+        byte_mask: torch.Tensor,
+        lexical_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del byte_mask  # Padding has a fixed zero embedding and bias-free convolutions.
+        candidate_words = self.encode_words(candidate_ids, candidate_mask)
+        candidate_bytes = self.encode_bytes(byte_ids)
+        candidates = self.candidate_norm(candidate_words + candidate_bytes)
+        left = self.encode_words(left_ids, left_mask)
+        right = self.encode_words(right_ids, right_mask)
+
+        candidate_grid = candidates[:, None, :, :].expand(-1, 3, -1, -1)
+        left_grid = left[:, :, None, :].expand(-1, -1, 6, -1)
+        right_grid = right[:, :, None, :].expand(-1, -1, 6, -1)
+        compatibility_features = torch.cat(
+            [
+                candidate_grid,
+                left_grid,
+                right_grid,
+                candidate_grid * left_grid,
+                candidate_grid * right_grid,
+                torch.abs(candidate_grid - left_grid),
+                torch.abs(candidate_grid - right_grid),
+                lexical_features,
+            ],
+            dim=-1,
+        )
+        compatibility = self.compatibility_head(compatibility_features).squeeze(-1)
+        originality_features = torch.cat(
+            [candidate_words, candidate_bytes, torch.abs(candidate_words - candidate_bytes)], dim=-1
+        )
+        originality = self.originality_head(originality_features).squeeze(-1)
+        return compatibility, originality
+
+
 def make_loader(
     rows: list[EncodedRow],
     indices: Sequence[int],
@@ -400,8 +644,41 @@ def make_loader(
     )
 
 
+def make_row_loader(
+    rows: list[EncodedRow],
+    indices: Sequence[int],
+    config: Config,
+    labelled: bool,
+    shuffle: bool,
+) -> DataLoader:
+    return DataLoader(
+        RowDataset(indices),
+        batch_size=config.batch_size,
+        shuffle=shuffle,
+        num_workers=config.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=RowBatchBuilder(rows, config, labelled),
+        drop_last=False,
+    )
+
+
 def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
     model_keys = ("input_ids", "segment_ids", "candidate_mask", "attention_mask")
+    return {key: batch[key].to(device, non_blocking=True) for key in model_keys}
+
+
+def move_row_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+    model_keys = (
+        "candidate_ids",
+        "candidate_mask",
+        "left_ids",
+        "left_mask",
+        "right_ids",
+        "right_mask",
+        "byte_ids",
+        "byte_mask",
+        "lexical_features",
+    )
     return {key: batch[key].to(device, non_blocking=True) for key in model_keys}
 
 
@@ -420,10 +697,10 @@ def train_model(
     vocabulary_size: int,
     device: torch.device,
     validation_indices: Sequence[int] | None = None,
-) -> tuple[CoherenceTransformer, dict[str, float]]:
+) -> tuple[HybridCoherenceModel, dict[str, float]]:
     seed_everything(config.seed)
-    model = CoherenceTransformer(vocabulary_size, config).to(device)
-    loader = make_loader(rows, train_indices, config, labelled=True, shuffle=True)
+    model = HybridCoherenceModel(vocabulary_size, config).to(device)
+    loader = make_row_loader(rows, train_indices, config, labelled=True, shuffle=True)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -448,14 +725,15 @@ def train_model(
         epoch_start = time.time()
         for batch in loader:
             optimizer.zero_grad(set_to_none=True)
-            model_inputs = move_batch(batch, device)
+            model_inputs = move_row_batch(batch, device)
             target = batch["targets"].to(device, non_blocking=True)
             originals = batch["originals"].to(device, non_blocking=True)
             with autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 compatibility, originality = model(**model_inputs)
-                compatibility = compatibility.view(-1, 6)
-                originality = originality.view(-1, 6)
-                rank_loss = F.cross_entropy(compatibility + originality, target)
+                rank_loss = F.cross_entropy(
+                    (compatibility + originality[:, None, :]).reshape(-1, 6),
+                    target.reshape(-1),
+                )
                 originality_loss = F.binary_cross_entropy_with_logits(originality, originals)
                 loss = rank_loss + config.originality_loss_weight * originality_loss
             scaler.scale(loss).backward()
@@ -464,7 +742,7 @@ def train_model(
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-            group_count = target.numel()
+            group_count = target.shape[0]
             running_loss += float(loss.detach()) * group_count
             seen += group_count
 
@@ -491,29 +769,28 @@ def train_model(
 
 @torch.no_grad()
 def score_rows(
-    model: CoherenceTransformer,
+    model: HybridCoherenceModel,
     rows: list[EncodedRow],
     indices: Sequence[int],
     config: Config,
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
-    loader = make_loader(rows, indices, config, labelled=False, shuffle=False)
+    loader = make_row_loader(rows, indices, config, labelled=False, shuffle=False)
     local_position = {int(row_index): position for position, row_index in enumerate(indices)}
     compatibility_scores = np.zeros((len(indices), 3, 6), dtype=np.float32)
     originality_scores = np.zeros((len(indices), 3, 6), dtype=np.float32)
     amp_enabled = device.type == "cuda"
     for batch in loader:
         with autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-            compatibility, originality = model(**move_batch(batch, device))
-        compatibility = compatibility.view(-1, 6).float().cpu().numpy()
-        originality = originality.view(-1, 6).float().cpu().numpy()
+            compatibility, originality = model(**move_row_batch(batch, device))
+        compatibility = compatibility.float().cpu().numpy()
+        originality = originality.float().cpu().numpy()
         row_indices = batch["row_indices"].numpy()
-        gap_indices = batch["gap_indices"].numpy()
-        for batch_index, (row_index, gap_index) in enumerate(zip(row_indices, gap_indices)):
+        for batch_index, row_index in enumerate(row_indices):
             position = local_position[int(row_index)]
-            compatibility_scores[position, int(gap_index)] = compatibility[batch_index]
-            originality_scores[position, int(gap_index)] = originality[batch_index]
+            compatibility_scores[position] = compatibility[batch_index]
+            originality_scores[position] = np.repeat(originality[batch_index][None, :], 3, axis=0)
     return compatibility_scores, originality_scores
 
 
