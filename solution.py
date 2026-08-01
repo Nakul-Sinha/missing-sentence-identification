@@ -1859,8 +1859,14 @@ def run_scratch_bert(
     evaluation_test_rows = encode_frame(test_frame, evaluation_vocabulary, labelled=False)
     train_indices = np.arange(len(train_frame), dtype=np.int64)
     test_indices = np.arange(len(test_frame), dtype=np.int64)
-    raw_count_model = fit_raw_count_originality(evaluation_train_rows, train_indices, config.seed)
-    test_ngram = score_raw_count_originality(evaluation_test_rows, test_indices, raw_count_model)
+    test_ngram: np.ndarray | None = None
+    if args.ngram_weight != 0.0:
+        raw_count_model = fit_raw_count_originality(
+            evaluation_train_rows, train_indices, config.seed
+        )
+        test_ngram = score_raw_count_originality(
+            evaluation_test_rows, test_indices, raw_count_model
+        )
     encoder = train_masked_language_encoder(train_frame, tokenizer, config, device)
     subword_train_rows = encode_subword_frame(train_frame, tokenizer, labelled=True)
     subword_test_rows = encode_subword_frame(test_frame, tokenizer, labelled=False)
@@ -1968,14 +1974,23 @@ def run_causal_lm(
         return
 
     test_frame = pd.read_csv(data_dir / "test.csv")
+    expected_test_columns = ["id", "gap_1", "gap_2", "gap_3", "candidates"]
+    if list(test_frame.columns) != expected_test_columns:
+        raise ValueError(f"Unexpected test columns: {list(test_frame.columns)}")
     tokenizer = train_subword_tokenizer(train_frame, config)
     evaluation_vocabulary, _ = build_vocabulary(train_frame, config)
     evaluation_train_rows = encode_frame(train_frame, evaluation_vocabulary, labelled=True)
     evaluation_test_rows = encode_frame(test_frame, evaluation_vocabulary, labelled=False)
     train_indices = np.arange(len(train_frame), dtype=np.int64)
     test_indices = np.arange(len(test_frame), dtype=np.int64)
-    raw_count_model = fit_raw_count_originality(evaluation_train_rows, train_indices, config.seed)
-    test_ngram = score_raw_count_originality(evaluation_test_rows, test_indices, raw_count_model)
+    test_ngram: np.ndarray | None = None
+    if args.ngram_weight != 0.0:
+        raw_count_model = fit_raw_count_originality(
+            evaluation_train_rows, train_indices, config.seed
+        )
+        test_ngram = score_raw_count_originality(
+            evaluation_test_rows, test_indices, raw_count_model
+        )
     subword_test_rows = encode_subword_frame(test_frame, tokenizer, labelled=False)
     directional_sum = np.zeros((len(test_indices), 3, 6, 2, 3), dtype=np.float32)
     for ensemble_index in range(args.ensemble):
@@ -2013,20 +2028,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("mode", choices=("validate", "train-predict"), nargs="?", default="train-predict")
     parser.add_argument("--data-dir", type=Path, default=Path("dataset"))
     parser.add_argument(
-        "--architecture", choices=("causal-lm", "scratch-bert", "hybrid"), default="hybrid"
+        "--architecture", choices=("causal-lm", "scratch-bert", "hybrid"), default="causal-lm"
     )
     parser.add_argument("--output", type=Path, default=Path("working/submission.csv"))
     parser.add_argument("--epochs", type=int, default=Config.epochs)
     parser.add_argument("--ensemble", type=int, default=2)
-    parser.add_argument("--batch-size", type=int, default=Config.batch_size)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=Config.seed)
-    parser.add_argument("--originality-weight", type=float, default=1.0)
-    parser.add_argument("--ngram-weight", type=float, default=0.5)
-    parser.add_argument("--bridge-weight", type=float, default=4.0)
+    parser.add_argument("--originality-weight", type=float, default=4.0)
+    parser.add_argument("--ngram-weight", type=float, default=0.0)
+    parser.add_argument("--bridge-weight", type=float, default=1.0)
     parser.add_argument("--mlm-epochs", type=int, default=Config.mlm_epochs)
     parser.add_argument("--causal-epochs", type=int, default=Config.causal_epochs)
-    parser.add_argument("--forward-weight", type=float, default=0.5)
-    parser.add_argument("--boundary-weight", type=float, default=0.5)
+    parser.add_argument("--forward-weight", type=float, default=0.75)
+    parser.add_argument("--boundary-weight", type=float, default=0.75)
     return parser.parse_args()
 
 
