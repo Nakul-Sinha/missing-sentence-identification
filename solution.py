@@ -40,8 +40,8 @@ from torch.utils.data import DataLoader, Dataset
 
 LETTERS = "ABCDEF"
 CANDIDATE_RE = re.compile(r"^\[([A-F])\]\s(.*)$")
-TOKEN_RE = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*|\d+|[^\w\s]", re.UNICODE)
-WORD_RE = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*|\d+", re.UNICODE)
+TOKEN_RE = re.compile(r"[A-Za-z]+(?:['\u2019][A-Za-z]+)*|\d+|[^\w\s]", re.UNICODE)
+WORD_RE = re.compile(r"[A-Za-z]+(?:['\u2019][A-Za-z]+)*|\d+", re.UNICODE)
 SPECIAL_TOKENS = ("<pad>", "<unk>", "<cls>", "<left>", "<cand>", "<right>")
 PAD, UNK, CLS, LEFT, CAND, RIGHT = range(len(SPECIAL_TOKENS))
 
@@ -85,11 +85,11 @@ def seed_everything(seed: int) -> None:
 
 
 def tokenize(text: str) -> list[str]:
-    return [token.lower().replace("’", "'") for token in TOKEN_RE.findall(str(text))]
+    return [token.lower().replace("\u2019", "'") for token in TOKEN_RE.findall(str(text))]
 
 
 def normalized_words(text: str) -> str:
-    return " ".join(token.lower().replace("’", "'") for token in WORD_RE.findall(str(text)))
+    return " ".join(token.lower().replace("\u2019", "'") for token in WORD_RE.findall(str(text)))
 
 
 def parse_candidates(value: str) -> dict[str, str]:
@@ -195,7 +195,7 @@ def encode_bytes(text: str) -> list[int]:
 def lexical_pair_features(left: str, right: str, candidate: str) -> list[float]:
     """Stateless, non-TF-IDF cohesion features for one gap/candidate pair."""
     def words(value: str) -> list[str]:
-        return [token.lower().replace("’", "'") for token in WORD_RE.findall(value)]
+        return [token.lower().replace("\u2019", "'") for token in WORD_RE.findall(value)]
 
     candidate_words = words(candidate)
     left_words = words(left)
@@ -206,8 +206,8 @@ def lexical_pair_features(left: str, right: str, candidate: str) -> list[float]:
     context_set = left_set | right_set
     content_set = {token for token in candidate_set if len(token) >= 4}
     context_content = {token for token in context_set if len(token) >= 4}
-    candidate_caps = set(re.findall(r"\b[A-Z][A-Za-z'’]{2,}\b", candidate))
-    context_caps = set(re.findall(r"\b[A-Z][A-Za-z'’]{2,}\b", f"{left} {right}"))
+    candidate_caps = set(re.findall(r"\b[A-Z][A-Za-z'\u2019]{2,}\b", candidate))
+    context_caps = set(re.findall(r"\b[A-Z][A-Za-z'\u2019]{2,}\b", f"{left} {right}"))
     denominator = max(1, len(candidate_set))
     content_denominator = max(1, len(content_set))
     return [
@@ -217,10 +217,10 @@ def lexical_pair_features(left: str, right: str, candidate: str) -> list[float]:
         len(candidate_set & right_set) / denominator,
         len(content_set & context_content) / content_denominator,
         math.log1p(len(candidate_caps & context_caps)) / 3.0,
-        float(candidate.lstrip().startswith(('"', "'", '“'))),
-        float(candidate.rstrip().endswith(('"', "'", '”'))),
-        float(left.rstrip().endswith(('"', "'", '”'))),
-        float(right.lstrip().startswith(('"', "'", '“'))),
+        float(candidate.lstrip().startswith(('"', "'", "\u201c"))),
+        float(candidate.rstrip().endswith(('"', "'", "\u201d"))),
+        float(left.rstrip().endswith(('"', "'", "\u201d"))),
+        float(right.lstrip().startswith(('"', "'", "\u201c"))),
         float(bool(candidate_words) and candidate_words[0] in right_set),
         float(bool(candidate_words) and candidate_words[-1] in left_set),
     ]
