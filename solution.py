@@ -34,6 +34,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.linear_model import SGDClassifier
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 
@@ -66,7 +68,8 @@ class Config:
     weight_decay: float = 0.02
     warmup_fraction: float = 0.08
     grad_clip: float = 1.0
-    originality_loss_weight: float = 0.35
+    originality_loss_weight: float = 1.0
+    pair_loss_weight: float = 1.0
     validation_fraction: float = 0.15
     num_workers: int = 0
 
@@ -174,6 +177,7 @@ class EncodedRow:
     left: list[list[int]]
     right: list[list[int]]
     candidates: list[list[int]]
+    candidate_texts: list[str]
     candidate_bytes: list[list[int]]
     lexical_features: list[list[list[float]]]
     pairs: list[tuple[int, int]]
@@ -239,6 +243,7 @@ def encode_frame(frame: pd.DataFrame, vocabulary: dict[str, int], labelled: bool
             left_parts.append(encode_text(left, vocabulary))
             right_parts.append(encode_text(right, vocabulary))
         candidate_ids = [encode_text(parsed[letter], vocabulary) for letter in LETTERS]
+        candidate_texts = [parsed[letter] for letter in LETTERS]
         candidate_byte_ids = [encode_bytes(parsed[letter]) for letter in LETTERS]
         lexical = [
             [lexical_pair_features(left, right, parsed[letter]) for letter in LETTERS]
@@ -259,6 +264,7 @@ def encode_frame(frame: pd.DataFrame, vocabulary: dict[str, int], labelled: bool
                 left=left_parts,
                 right=right_parts,
                 candidates=candidate_ids,
+                candidate_texts=candidate_texts,
                 candidate_bytes=candidate_byte_ids,
                 lexical_features=lexical,
                 pairs=candidate_pairs(parsed),
@@ -349,11 +355,19 @@ class RowBatchBuilder:
             "lexical_features": torch.tensor(
                 [row.lexical_features for row in batch_rows], dtype=torch.float32
             ),
+            "pairs": torch.tensor([row.pairs for row in batch_rows], dtype=torch.long),
             "row_indices": torch.tensor(row_indices, dtype=torch.long),
         }
         if self.labelled:
             result["targets"] = torch.tensor([row.targets for row in batch_rows], dtype=torch.long)
             result["originals"] = torch.tensor([row.originals for row in batch_rows], dtype=torch.float32)
+            result["pair_targets"] = torch.tensor(
+                [
+                    [next(index for index, pair in enumerate(row.pairs) if target in pair) for target in row.targets]
+                    for row in batch_rows
+                ],
+                dtype=torch.long,
+            )
         return result
 
 
@@ -697,6 +711,7 @@ def train_model(
     vocabulary_size: int,
     device: torch.device,
     validation_indices: Sequence[int] | None = None,
+    validation_ngram: np.ndarray | None = None,
 ) -> tuple[HybridCoherenceModel, dict[str, float]]:
     seed_everything(config.seed)
     model = HybridCoherenceModel(vocabulary_size, config).to(device)
@@ -728,14 +743,24 @@ def train_model(
             model_inputs = move_row_batch(batch, device)
             target = batch["targets"].to(device, non_blocking=True)
             originals = batch["originals"].to(device, non_blocking=True)
+            pairs = batch["pairs"].to(device, non_blocking=True)
+            pair_targets = batch["pair_targets"].to(device, non_blocking=True)
             with autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 compatibility, originality = model(**model_inputs)
                 rank_loss = F.cross_entropy(
                     (compatibility + originality[:, None, :]).reshape(-1, 6),
                     target.reshape(-1),
                 )
+                pair_indices = pairs[:, None, :, :].expand(-1, 3, -1, -1)
+                expanded_compatibility = compatibility[:, :, None, :].expand(-1, -1, 3, -1)
+                pair_logits = torch.gather(expanded_compatibility, 3, pair_indices).mean(dim=-1)
+                pair_loss = F.cross_entropy(pair_logits.reshape(-1, 3), pair_targets.reshape(-1))
                 originality_loss = F.binary_cross_entropy_with_logits(originality, originals)
-                loss = rank_loss + config.originality_loss_weight * originality_loss
+                loss = (
+                    rank_loss
+                    + config.pair_loss_weight * pair_loss
+                    + config.originality_loss_weight * originality_loss
+                )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
@@ -754,7 +779,13 @@ def train_model(
         }
         if validation_indices is not None:
             compatibility, originality = score_rows(model, rows, validation_indices, config, device)
-            details = tune_and_evaluate(rows, validation_indices, compatibility, originality)
+            details = tune_and_evaluate(
+                rows,
+                validation_indices,
+                compatibility,
+                originality,
+                ngram_originality=validation_ngram,
+            )
             message.update(details)
             if details["meridian"] > best_score:
                 best_score = details["meridian"]
@@ -794,16 +825,65 @@ def score_rows(
     return compatibility_scores, originality_scores
 
 
+def fit_raw_count_originality(
+    rows: list[EncodedRow], indices: Sequence[int], seed: int
+) -> tuple[CountVectorizer, SGDClassifier]:
+    """Fit a raw word-order model; deliberately uses no TF-IDF weighting."""
+    texts: list[str] = []
+    labels: list[float] = []
+    for row_index in indices:
+        row = rows[int(row_index)]
+        assert row.originals is not None
+        texts.extend(row.candidate_texts)
+        labels.extend(row.originals)
+    vectorizer = CountVectorizer(
+        ngram_range=(2, 4),
+        min_df=2,
+        max_features=300_000,
+        binary=True,
+        token_pattern=r"(?u)\b\w[\w']+\b",
+        dtype=np.float32,
+    )
+    matrix = vectorizer.fit_transform(texts)
+    classifier = SGDClassifier(
+        loss="log_loss",
+        alpha=2e-6,
+        max_iter=50,
+        tol=1e-4,
+        random_state=seed,
+        average=True,
+        class_weight="balanced",
+    )
+    classifier.fit(matrix, labels)
+    return vectorizer, classifier
+
+
+def score_raw_count_originality(
+    rows: list[EncodedRow],
+    indices: Sequence[int],
+    model: tuple[CountVectorizer, SGDClassifier],
+) -> np.ndarray:
+    vectorizer, classifier = model
+    texts = [text for row_index in indices for text in rows[int(row_index)].candidate_texts]
+    scores = classifier.decision_function(vectorizer.transform(texts)).astype(np.float32)
+    return scores.reshape(len(indices), 6)
+
+
 def decode_row(
     row: EncodedRow,
     compatibility: np.ndarray,
     originality: np.ndarray,
     originality_weight: float,
+    ngram_originality: np.ndarray | None = None,
+    ngram_weight: float = 0.0,
 ) -> list[int]:
     # Average the auxiliary signal across gaps so that it reflects sentence
     # fluency rather than accidental compatibility with one context.
     stable_originality = originality.mean(axis=0)
-    scores = compatibility + originality_weight * stable_originality[None, :]
+    stable_originality = originality_weight * stable_originality
+    if ngram_originality is not None:
+        stable_originality = stable_originality + ngram_weight * ngram_originality
+    scores = compatibility + stable_originality[None, :]
     best_score = -float("inf")
     best_assignment: list[int] | None = None
     # Exactly one member of every same-token pair, with the three selected
@@ -853,17 +933,29 @@ def tune_and_evaluate(
     indices: Sequence[int],
     compatibility: np.ndarray,
     originality: np.ndarray,
+    ngram_originality: np.ndarray | None = None,
 ) -> dict[str, float]:
     best: dict[str, float] | None = None
-    for weight in np.arange(0.0, 3.01, 0.25):
-        predictions = [
-            decode_row(rows[int(row_index)], compatibility[position], originality[position], float(weight))
-            for position, row_index in enumerate(indices)
-        ]
-        details = evaluate_predictions(rows, indices, predictions)
-        details["originality_weight"] = float(weight)
-        if best is None or details["meridian"] > best["meridian"]:
-            best = details
+    originality_weights = (0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0)
+    ngram_weights = (0.0,) if ngram_originality is None else (0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+    for weight in originality_weights:
+        for ngram_weight in ngram_weights:
+            predictions = [
+                decode_row(
+                    rows[int(row_index)],
+                    compatibility[position],
+                    originality[position],
+                    float(weight),
+                    None if ngram_originality is None else ngram_originality[position],
+                    float(ngram_weight),
+                )
+                for position, row_index in enumerate(indices)
+            ]
+            details = evaluate_predictions(rows, indices, predictions)
+            details["originality_weight"] = float(weight)
+            details["ngram_weight"] = float(ngram_weight)
+            if best is None or details["meridian"] > best["meridian"]:
+                best = details
     assert best is not None
     return best
 
@@ -933,10 +1025,19 @@ def write_submission(
     compatibility: np.ndarray,
     originality: np.ndarray,
     originality_weight: float,
+    ngram_originality: np.ndarray | None = None,
+    ngram_weight: float = 0.0,
 ) -> None:
     bindings: list[str] = []
     for position, row in enumerate(rows):
-        assignment = decode_row(row, compatibility[position], originality[position], originality_weight)
+        assignment = decode_row(
+            row,
+            compatibility[position],
+            originality[position],
+            originality_weight,
+            None if ngram_originality is None else ngram_originality[position],
+            ngram_weight,
+        )
         bindings.append(">".join(LETTERS[index] for index in assignment))
     submission = pd.DataFrame({"id": [row.row_id for row in rows], "binding": bindings})
     validate_submission(submission, rows)
@@ -968,6 +1069,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--originality-weight", type=float, default=1.0)
+    parser.add_argument("--ngram-weight", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -990,6 +1092,8 @@ def main() -> None:
     if args.mode == "validate":
         train_indices, validation_indices = grouped_split(train_frame, config.validation_fraction, config.seed)
         print(json.dumps({"train_rows": len(train_indices), "validation_rows": len(validation_indices)}))
+        raw_count_model = fit_raw_count_originality(train_rows, train_indices, config.seed)
+        validation_ngram = score_raw_count_originality(train_rows, validation_indices, raw_count_model)
         _, details = train_model(
             train_rows,
             train_indices,
@@ -997,6 +1101,7 @@ def main() -> None:
             len(vocabulary),
             device,
             validation_indices=validation_indices,
+            validation_ngram=validation_ngram,
         )
         print(json.dumps({"best_validation": details}, sort_keys=True))
         return
@@ -1011,6 +1116,8 @@ def main() -> None:
     test_indices = np.arange(len(test_rows), dtype=np.int64)
     compatibility_sum = np.zeros((len(test_rows), 3, 6), dtype=np.float32)
     originality_sum = np.zeros((len(test_rows), 3, 6), dtype=np.float32)
+    raw_count_model = fit_raw_count_originality(train_rows, train_indices, config.seed)
+    test_ngram = score_raw_count_originality(test_rows, test_indices, raw_count_model)
     for ensemble_index in range(args.ensemble):
         member_config = Config(**{**asdict(config), "seed": config.seed + 1009 * ensemble_index})
         model, _ = train_model(train_rows, train_indices, member_config, len(vocabulary), device)
@@ -1027,6 +1134,8 @@ def main() -> None:
         compatibility_sum,
         originality_sum,
         args.originality_weight,
+        test_ngram,
+        args.ngram_weight,
     )
     print(json.dumps({"submission": str(args.output), "rows": len(test_rows)}))
 
