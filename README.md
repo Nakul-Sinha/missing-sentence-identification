@@ -1,63 +1,33 @@
-# Meridian Ashes - Missing Sentence Identification
+# Missing Sentence Identification
 
-Offline, from-scratch solution for the Meridian Ashes challenge.
+## The problem
 
-## Result
+I get a story excerpt with three sentences removed, plus a pool of candidate
+sentences. Each real sentence is paired with a counterfeit built from the same
+tokens, so I cannot lean on vocabulary overlap. I have to decide which candidates
+are genuine and assign them bijectively to the three gaps. Scoring breaks into
+exact binding, membership, position, and precedence.
 
-The selected model achieved a grouped validation MeridianScore of **0.79808**:
+## What I did
 
-| Component | Score |
-| --- | ---: |
-| Exact binding | 0.72647 |
-| Membership | 0.98632 |
-| Position | 0.81604 |
-| Precedence | 0.84178 |
+Everything trains from random initialization on the supplied training file. No
+pretrained weights, no external corpora, no network calls, no TF-IDF.
 
-Rows sharing a long exact context sentence are placed in the same split, so
-near-duplicate story excerpts cannot cross from training into validation.
+I fit a byte-BPE tokenizer on the training text, then train a compact GPT-style
+causal language model on reconstructed excerpts in both forward and reverse token
+order. Reading in both directions matters, because a sentence that belongs in a
+gap should look fluent from the left and from the right. Each candidate insertion
+then gets separate whole-sentence fluency and local boundary-coherence scores from
+both directions. A supervised coherence verifier fine-tunes the last two causal
+blocks to handle the bijective assignment, and the decoder evaluates all 48 valid
+hypotheses: one member of each original and counterfeit pair, assigned across the
+three gaps.
 
-## Model
+Grouped validation score: 0.798, with exact binding at 0.726 and membership at
+0.986.
 
-`solution.py` trains everything from random initialization on `train.csv`:
+## Layout
 
-1. A byte-BPE tokenizer is fitted on training text only.
-2. A compact GPT-style causal language model is trained on reconstructed
-   original excerpts in both forward and reverse token order.
-3. Each candidate insertion receives separate whole-sentence fluency and local
-   boundary-coherence scores from both directions.
-4. A supervised coherence verifier fine-tunes the final two causal blocks to
-   assign the three same-token candidate pairs bijectively to the three gaps.
-5. The decoder evaluates the 48 valid hypotheses: one member from each
-   same-token original/counterfeit pair, assigned bijectively to three gaps.
-
-There are no pretrained weights, external corpora, TF-IDF features, hosted
-inference calls, test-time fitting steps, package installers, or network calls.
-
-The design follows the local/global coherence and constrained-ordering ideas in
-[Shen and Baldwin (2021)](https://aclanthology.org/2021.sigdial-1.16/) and
-[Oh et al. (2019)](https://aclanthology.org/D19-1232/), adapted to train from
-scratch on the supplied challenge data.
-
-## Run
-
-The platform supplies the public-data directory and submission output path as
-two positional arguments. Run:
-
-```bash
-python3 solution.py <public_dir> <submission_out>
-```
-
-The script reads `<public_dir>/train.csv` and `<public_dir>/test.csv`, creates
-the parent directory for `<submission_out>`, and writes the CSV exactly there.
-
-The selected validation run completed on a Kaggle T4 in 3,777 seconds
-(approximately 63.0 minutes), including four verifier epochs used to select the
-best checkpoint. The production defaults use the selected two verifier epochs;
-the final all-training-data run, including test scoring and CSV creation,
-completed in 3,479 seconds (approximately 58.0 minutes).
-
-For the leakage-safe validation used above:
-
-```bash
-python solution.py dataset/public working/validation.csv --mode validate --ensemble 1
-```
+`python3 solution.py <public_dir> <submission_out>` runs it end to end.
+`TECHNICAL.md` has the full method and the references the design draws on.
+Datasets are not committed.
