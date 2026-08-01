@@ -1,8 +1,9 @@
 """Offline, from-scratch solver for Meridian Ashes.
 
-The model is a compact Transformer encoder initialized randomly and trained only
-on train.csv.  Test text is tokenized with the frozen train vocabulary and is
-never used for fitting, model selection, or early stopping.
+The primary model is a compact GPT-style causal language model plus a structured
+coherence verifier, both initialized randomly and trained only on train.csv.
+Test text is tokenized with the frozen train vocabulary and is never used for
+fitting, model selection, or early stopping.
 
 Platform invocation::
 
@@ -16,6 +17,7 @@ Honest grouped validation for development::
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import random
@@ -56,9 +58,9 @@ class Config:
     seed: int = 2026
     vocab_size: int = 40_000
     min_frequency: int = 2
-    left_tokens: int = 64
+    left_tokens: int = 96
     candidate_tokens: int = 72
-    right_tokens: int = 64
+    right_tokens: int = 96
     candidate_bytes: int = 384
     d_model: int = 192
     heads: int = 6
@@ -76,12 +78,19 @@ class Config:
     validation_fraction: float = 0.15
     num_workers: int = 0
     subword_vocab_size: int = 8_000
-    mlm_length: int = 192
+    mlm_length: int = 256
     mlm_epochs: int = 5
     mlm_batch_size: int = 64
     rank_batch_size: int = 12
-    causal_epochs: int = 8
-    causal_batch_size: int = 64
+    causal_epochs: int = 12
+    causal_batch_size: int = 40
+    causal_hidden_size: int = 384
+    causal_layers: int = 6
+    causal_heads: int = 8
+    causal_inner_size: int = 1152
+    verifier_epochs: int = 20
+    finetune_epochs: int = 2
+    finetune_layers: int = 2
 
     @property
     def max_length(self) -> int:
@@ -1335,9 +1344,11 @@ def train_bidirectional_causal_lm(
     sep_id = tokenizer.token_to_id("[SEP]")
     sequences: list[list[int]] = []
     for text in original_training_excerpts(frame):
-        content = tokenizer.encode(text, add_special_tokens=False).ids[: config.mlm_length - 2]
-        sequences.append([forward_id] + content + [sep_id])
-        sequences.append([reverse_id] + list(reversed(content)) + [sep_id])
+        full_content = tokenizer.encode(text, add_special_tokens=False).ids
+        forward_content = full_content[: config.mlm_length - 2]
+        reverse_content = list(reversed(full_content[-(config.mlm_length - 2) :]))
+        sequences.append([forward_id] + forward_content + [sep_id])
+        sequences.append([reverse_id] + reverse_content + [sep_id])
     loader = DataLoader(
         CausalSequenceDataset(sequences),
         batch_size=config.causal_batch_size,
@@ -1350,10 +1361,10 @@ def train_bidirectional_causal_lm(
         vocab_size=tokenizer.get_vocab_size(),
         n_positions=config.mlm_length,
         n_ctx=config.mlm_length,
-        n_embd=256,
-        n_layer=4,
-        n_head=8,
-        n_inner=768,
+        n_embd=config.causal_hidden_size,
+        n_layer=config.causal_layers,
+        n_head=config.causal_heads,
+        n_inner=config.causal_inner_size,
         resid_pdrop=0.10,
         embd_pdrop=0.10,
         attn_pdrop=0.10,
@@ -1402,7 +1413,19 @@ def train_bidirectional_causal_lm(
 
 
 class CausalScoringDataset(
-    Dataset[tuple[list[int], list[bool], list[bool], list[bool], int, int, int, int]]
+    Dataset[
+        tuple[
+            list[int],
+            list[bool],
+            list[bool],
+            list[bool],
+            list[bool],
+            int,
+            int,
+            int,
+            int,
+        ]
+    ]
 ):
     def __init__(
         self,
@@ -1423,7 +1446,17 @@ class CausalScoringDataset(
 
     def __getitem__(
         self, index: int
-    ) -> tuple[list[int], list[bool], list[bool], list[bool], int, int, int, int]:
+    ) -> tuple[
+        list[int],
+        list[bool],
+        list[bool],
+        list[bool],
+        list[bool],
+        int,
+        int,
+        int,
+        int,
+    ]:
         direction = index % 2
         base = index // 2
         candidate_index = base % 6
@@ -1454,6 +1487,12 @@ class CausalScoringDataset(
                 + [True] * len(candidate)
                 + [False] * (len(right) + 1)
             )
+            verifier_mask = (
+                [False] * (1 + len(left) + max(0, len(candidate) - 8))
+                + [True] * min(8, len(candidate))
+                + [True] * min(16, len(right))
+                + [False] * (len(right) - min(16, len(right)) + 1)
+            )
         else:
             right = list(reversed(row.right[gap_index][: self.config.right_tokens]))
             reversed_candidate = list(reversed(candidate))
@@ -1477,11 +1516,18 @@ class CausalScoringDataset(
                 + [True] * len(reversed_candidate)
                 + [False] * (len(left) + 1)
             )
+            verifier_mask = (
+                [False] * (1 + len(right) + max(0, len(reversed_candidate) - 8))
+                + [True] * min(8, len(reversed_candidate))
+                + [True] * min(16, len(left))
+                + [False] * (len(left) - min(16, len(left)) + 1)
+            )
         return (
             sequence,
             total_mask,
             boundary_mask,
             fluency_mask,
+            verifier_mask,
             local_row,
             gap_index,
             candidate_index,
@@ -1496,7 +1542,17 @@ class CausalScoreCollator:
     def __call__(
         self,
         items: Sequence[
-            tuple[list[int], list[bool], list[bool], list[bool], int, int, int, int]
+            tuple[
+                list[int],
+                list[bool],
+                list[bool],
+                list[bool],
+                list[bool],
+                int,
+                int,
+                int,
+                int,
+            ]
         ],
     ) -> dict[str, torch.Tensor]:
         max_length = max(len(item[0]) for item in items)
@@ -1505,12 +1561,14 @@ class CausalScoreCollator:
         total_mask = torch.zeros_like(input_ids, dtype=torch.bool)
         boundary_mask = torch.zeros_like(input_ids, dtype=torch.bool)
         fluency_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        verifier_mask = torch.zeros_like(input_ids, dtype=torch.bool)
         metadata = torch.zeros((len(items), 4), dtype=torch.long)
         for index, (
             sequence,
             total,
             boundary,
             fluency,
+            verifier,
             row,
             gap,
             candidate,
@@ -1521,6 +1579,7 @@ class CausalScoreCollator:
             total_mask[index, : len(total)] = torch.tensor(total)
             boundary_mask[index, : len(boundary)] = torch.tensor(boundary)
             fluency_mask[index, : len(fluency)] = torch.tensor(fluency)
+            verifier_mask[index, : len(verifier)] = torch.tensor(verifier)
             metadata[index] = torch.tensor([row, gap, candidate, direction])
         return {
             "input_ids": input_ids,
@@ -1528,6 +1587,7 @@ class CausalScoreCollator:
             "total_mask": total_mask,
             "boundary_mask": boundary_mask,
             "fluency_mask": fluency_mask,
+            "verifier_mask": verifier_mask,
             "metadata": metadata,
         }
 
@@ -1535,6 +1595,503 @@ class CausalScoreCollator:
 @torch.no_grad()
 def score_causal_insertions(
     model: GPT2LMHeadModel,
+    rows: list[SubwordRow],
+    indices: Sequence[int],
+    tokenizer: Tokenizer,
+    config: Config,
+    device: torch.device,
+    return_features: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    loader = DataLoader(
+        CausalScoringDataset(rows, indices, tokenizer, config),
+        batch_size=64,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        collate_fn=CausalScoreCollator(tokenizer.token_to_id("[PAD]")),
+    )
+    directional = np.zeros((len(indices), 3, 6, 2, 3), dtype=np.float32)
+    feature_size = model.config.n_embd * 2 + 3
+    verifier_features = (
+        np.zeros((len(indices), 3, 6, 2, feature_size), dtype=np.float16)
+        if return_features
+        else None
+    )
+    for batch in loader:
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        with autocast(device_type=device.type, dtype=torch.float16, enabled=True):
+            output = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=return_features,
+            )
+            logits = output.logits
+            token_log_probs = F.log_softmax(logits[:, :-1], dim=-1)
+            target_ids = input_ids[:, 1:]
+            selected = torch.gather(token_log_probs, 2, target_ids.unsqueeze(-1)).squeeze(-1)
+            component_scores = []
+            for key in ("total_mask", "boundary_mask", "fluency_mask"):
+                mask = batch[key][:, 1:].to(device, non_blocking=True)
+                component_scores.append(
+                    (selected * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+                )
+            scores = torch.stack(component_scores, dim=-1)
+            features = None
+            if return_features:
+                hidden = output.hidden_states[-1]
+                pools = []
+                for key in ("fluency_mask", "verifier_mask"):
+                    mask = batch[key].to(device, non_blocking=True).unsqueeze(-1)
+                    pools.append(
+                        (hidden * mask).sum(dim=1)
+                        / mask.sum(dim=1).clamp_min(1).to(hidden.dtype)
+                    )
+                features = torch.cat([pools[0], pools[1], scores], dim=-1)
+        for score, metadata in zip(scores.float().cpu().numpy(), batch["metadata"].numpy()):
+            row, gap, candidate, direction = map(int, metadata)
+            directional[row, gap, candidate, direction, :] = score
+        if return_features:
+            assert features is not None and verifier_features is not None
+            for feature, metadata in zip(
+                features.float().cpu().numpy(), batch["metadata"].numpy()
+            ):
+                row, gap, candidate, direction = map(int, metadata)
+                verifier_features[row, gap, candidate, direction, :] = feature
+    if return_features:
+        assert verifier_features is not None
+        return directional, verifier_features
+    return directional
+
+
+VERIFIER_PERMUTATIONS = list(permutations(range(3)))
+
+
+class CoherenceVerifier(nn.Module):
+    """Supervised row-level gap matcher over frozen from-scratch LM features."""
+
+    def __init__(self, direction_feature_size: int, kind: str = "mlp"):
+        super().__init__()
+        joint_size = direction_feature_size * 3
+        if kind == "linear":
+            self.head = nn.Sequential(
+                nn.LayerNorm(joint_size),
+                nn.Dropout(0.05),
+                nn.Linear(joint_size, 1),
+            )
+        elif kind == "tiny":
+            self.head = nn.Sequential(
+                nn.LayerNorm(joint_size),
+                nn.Linear(joint_size, 96),
+                nn.GELU(),
+                nn.Dropout(0.25),
+                nn.Linear(96, 1),
+            )
+        elif kind == "mlp":
+            self.head = nn.Sequential(
+                nn.LayerNorm(joint_size),
+                nn.Linear(joint_size, 384),
+                nn.GELU(),
+                nn.Dropout(0.20),
+                nn.Linear(384, 96),
+                nn.GELU(),
+                nn.Dropout(0.10),
+                nn.Linear(96, 1),
+            )
+        else:
+            raise ValueError(f"Unknown verifier kind: {kind}")
+        self.head.apply(CoherenceTransformer._initialize)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        forward = features[..., 0, :].float()
+        reverse = features[..., 1, :].float()
+        joint = torch.cat([forward, reverse, (forward - reverse).abs()], dim=-1)
+        return self.head(joint).squeeze(-1)
+
+
+def pair_targets_for_row(row: EncodedRow) -> list[int]:
+    assert row.targets is not None
+    return [
+        next(pair_index for pair_index, pair in enumerate(row.pairs) if target in pair)
+        for target in row.targets
+    ]
+
+
+def torch_pair_scores(scores: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
+    batch_size = scores.shape[0]
+    expanded_scores = scores[:, :, None, :].expand(batch_size, 3, 3, 6)
+    expanded_pairs = pairs[:, None, :, :].expand(batch_size, 3, 3, 2)
+    return torch.gather(expanded_scores, 3, expanded_pairs).mean(dim=-1)
+
+
+def structured_pair_logits(pair_scores: torch.Tensor) -> torch.Tensor:
+    batch_size = pair_scores.shape[0]
+    permutations_tensor = torch.tensor(
+        VERIFIER_PERMUTATIONS, dtype=torch.long, device=pair_scores.device
+    )
+    expanded = pair_scores[:, None, :, :].expand(batch_size, 6, 3, 3)
+    selected = torch.gather(
+        expanded,
+        3,
+        permutations_tensor[None, :, :, None].expand(batch_size, 6, 3, 1),
+    ).squeeze(-1)
+    return selected.sum(dim=-1)
+
+
+class VerifierFeatureDataset(Dataset[tuple[np.ndarray, np.ndarray, np.ndarray, int]]):
+    def __init__(
+        self,
+        features: np.ndarray,
+        rows: list[EncodedRow],
+        indices: Sequence[int],
+    ):
+        self.features = features
+        self.pairs = np.asarray([rows[int(index)].pairs for index in indices], dtype=np.int64)
+        self.pair_targets = np.asarray(
+            [pair_targets_for_row(rows[int(index)]) for index in indices], dtype=np.int64
+        )
+        permutation_lookup = {
+            tuple(permutation): index
+            for index, permutation in enumerate(VERIFIER_PERMUTATIONS)
+        }
+        self.permutation_targets = np.asarray(
+            [permutation_lookup[tuple(targets)] for targets in self.pair_targets],
+            dtype=np.int64,
+        )
+
+    def __len__(self) -> int:
+        return len(self.features)
+
+    def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+        return (
+            self.features[index],
+            self.pairs[index],
+            self.pair_targets[index],
+            int(self.permutation_targets[index]),
+        )
+
+
+@torch.no_grad()
+def score_coherence_verifier(
+    model: CoherenceVerifier,
+    features: np.ndarray,
+    device: torch.device,
+) -> np.ndarray:
+    model.eval()
+    output = np.zeros(features.shape[:3], dtype=np.float32)
+    for start in range(0, len(features), 128):
+        batch = torch.from_numpy(features[start : start + 128]).to(
+            device, non_blocking=True
+        )
+        with autocast(device_type=device.type, dtype=torch.float16, enabled=True):
+            output[start : start + len(batch)] = model(batch).float().cpu().numpy()
+    return output
+
+
+def pair_average_scores(
+    rows: list[EncodedRow],
+    indices: Sequence[int],
+    scores: np.ndarray,
+) -> np.ndarray:
+    averaged = np.empty_like(scores)
+    for local_index, row_index in enumerate(indices):
+        for first, second in rows[int(row_index)].pairs:
+            value = 0.5 * (
+                scores[local_index, :, first] + scores[local_index, :, second]
+            )
+            averaged[local_index, :, first] = value
+            averaged[local_index, :, second] = value
+    return averaged
+
+
+def evaluate_pair_mapping(
+    rows: list[EncodedRow],
+    indices: Sequence[int],
+    scores: np.ndarray,
+) -> dict[str, float]:
+    exact = 0
+    position = 0.0
+    for local_index, row_index in enumerate(indices):
+        row = rows[int(row_index)]
+        truth = pair_targets_for_row(row)
+        pair_values = np.asarray(
+            [
+                [
+                    0.5
+                    * (
+                        scores[local_index, gap, first]
+                        + scores[local_index, gap, second]
+                    )
+                    for first, second in row.pairs
+                ]
+                for gap in range(3)
+            ]
+        )
+        prediction = max(
+            VERIFIER_PERMUTATIONS,
+            key=lambda permutation: sum(
+                pair_values[gap, permutation[gap]] for gap in range(3)
+            ),
+        )
+        exact += list(prediction) == truth
+        position += sum(left == right for left, right in zip(prediction, truth)) / 3.0
+    return {
+        "verifier_pair_exact": exact / len(indices),
+        "verifier_pair_position": position / len(indices),
+    }
+
+
+def train_coherence_verifier(
+    features: np.ndarray,
+    rows: list[EncodedRow],
+    indices: Sequence[int],
+    config: Config,
+    device: torch.device,
+    validation_features: np.ndarray | None = None,
+    validation_indices: Sequence[int] | None = None,
+    kind: str = "mlp",
+) -> tuple[CoherenceVerifier, dict[str, float]]:
+    dataset = VerifierFeatureDataset(features, rows, indices)
+    loader = DataLoader(
+        dataset,
+        batch_size=64,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=True,
+    )
+    model = CoherenceVerifier(features.shape[-1], kind=kind).to(device)
+    learning_rate = {"linear": 1e-3, "tiny": 5e-4, "mlp": 3e-4}[kind]
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=0.05
+    )
+    total_steps = config.verifier_epochs * len(loader)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: learning_rate_factor(step, total_steps, config.warmup_fraction),
+    )
+    scaler = GradScaler(device.type, enabled=True)
+    best_key = (-1.0, -1.0)
+    best_state: dict[str, torch.Tensor] | None = None
+    best_details: dict[str, float] = {}
+    for epoch in range(config.verifier_epochs):
+        model.train()
+        total_loss = 0.0
+        total_rows = 0
+        started = time.time()
+        for batch_features, pairs, pair_targets, permutation_targets in loader:
+            optimizer.zero_grad(set_to_none=True)
+            batch_features = batch_features.to(device, non_blocking=True)
+            pairs = pairs.to(device, non_blocking=True)
+            pair_targets = pair_targets.to(device, non_blocking=True)
+            permutation_targets = permutation_targets.to(device, non_blocking=True)
+            with autocast(device_type=device.type, dtype=torch.float16, enabled=True):
+                scores = model(batch_features)
+                pair_scores = torch_pair_scores(scores, pairs)
+                gap_loss = F.cross_entropy(
+                    pair_scores.reshape(-1, 3),
+                    pair_targets.reshape(-1),
+                    label_smoothing=0.05,
+                )
+                permutation_loss = F.cross_entropy(
+                    structured_pair_logits(pair_scores),
+                    permutation_targets,
+                    label_smoothing=0.05,
+                )
+                loss = gap_loss + permutation_loss
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            previous_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            if scaler.get_scale() >= previous_scale:
+                scheduler.step()
+            count = len(batch_features)
+            total_loss += float(loss.detach()) * count
+            total_rows += count
+        message: dict[str, float | int] = {
+            "verifier_kind": kind,
+            "verifier_epoch": epoch + 1,
+            "verifier_loss": total_loss / total_rows,
+            "seconds": time.time() - started,
+        }
+        if validation_features is not None and validation_indices is not None:
+            validation_scores = score_coherence_verifier(
+                model, validation_features, device
+            )
+            details = evaluate_pair_mapping(
+                rows, validation_indices, validation_scores
+            )
+            message.update(details)
+            key = (
+                details["verifier_pair_exact"],
+                details["verifier_pair_position"],
+            )
+            if key > best_key:
+                best_key = key
+                best_details = details
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                }
+        print(json.dumps(message, sort_keys=True), flush=True)
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, best_details
+
+
+class LocalRowDataset(Dataset[int]):
+    def __init__(self, size: int):
+        self.size = size
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, index: int) -> int:
+        return index
+
+
+class SequenceVerifierRowCollator:
+    def __init__(
+        self,
+        rows: list[SubwordRow],
+        indices: Sequence[int],
+        tokenizer: Tokenizer,
+        config: Config,
+    ):
+        self.rows = rows
+        self.indices = [int(index) for index in indices]
+        self.base = CausalScoringDataset(rows, indices, tokenizer, config)
+        self.collate_sequences = CausalScoreCollator(
+            tokenizer.token_to_id("[PAD]")
+        )
+
+    def __call__(self, local_indices: Sequence[int]) -> dict[str, torch.Tensor]:
+        sequence_items = []
+        pairs = []
+        pair_targets = []
+        permutation_targets = []
+        permutation_lookup = {
+            tuple(permutation): index
+            for index, permutation in enumerate(VERIFIER_PERMUTATIONS)
+        }
+        for local_index in local_indices:
+            local_index = int(local_index)
+            row = self.rows[self.indices[local_index]]
+            assert row.targets is not None
+            for gap in range(3):
+                for candidate in range(6):
+                    for direction in range(2):
+                        flat_index = (
+                            (((local_index * 3 + gap) * 6 + candidate) * 2)
+                            + direction
+                        )
+                        sequence_items.append(self.base[flat_index])
+            row_pairs = row.pairs
+            row_pair_targets = [
+                next(
+                    pair_index
+                    for pair_index, pair in enumerate(row_pairs)
+                    if target in pair
+                )
+                for target in row.targets
+            ]
+            pairs.append(row_pairs)
+            pair_targets.append(row_pair_targets)
+            permutation_targets.append(
+                permutation_lookup[tuple(row_pair_targets)]
+            )
+        output = self.collate_sequences(sequence_items)
+        output["pairs"] = torch.tensor(pairs, dtype=torch.long)
+        output["pair_targets"] = torch.tensor(pair_targets, dtype=torch.long)
+        output["permutation_targets"] = torch.tensor(
+            permutation_targets, dtype=torch.long
+        )
+        return output
+
+
+class TrainableSequenceVerifier(nn.Module):
+    def __init__(self, language_model: GPT2LMHeadModel, finetune_layers: int):
+        super().__init__()
+        self.transformer = copy.deepcopy(language_model.transformer)
+        for parameter in self.transformer.parameters():
+            parameter.requires_grad = False
+        if not 1 <= finetune_layers <= len(self.transformer.h):
+            raise ValueError("finetune_layers must select at least one available block")
+        for block in self.transformer.h[-finetune_layers:]:
+            for parameter in block.parameters():
+                parameter.requires_grad = True
+        for parameter in self.transformer.ln_f.parameters():
+            parameter.requires_grad = True
+        hidden_size = language_model.config.n_embd
+        self.scorer = CoherenceVerifier(hidden_size * 2, kind="tiny")
+
+    def direction_features(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        fluency_mask: torch.Tensor,
+        verifier_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        ).last_hidden_state
+        pools = []
+        for mask in (fluency_mask, verifier_mask):
+            weights = mask.unsqueeze(-1).to(hidden.dtype)
+            pools.append(
+                (hidden * weights).sum(dim=1)
+                / weights.sum(dim=1).clamp_min(1.0)
+            )
+        return torch.cat(pools, dim=-1)
+
+    def score_rows(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        fluency_mask: torch.Tensor,
+        verifier_mask: torch.Tensor,
+        row_count: int,
+    ) -> torch.Tensor:
+        features = self.direction_features(
+            input_ids, attention_mask, fluency_mask, verifier_mask
+        )
+        features = features.view(row_count, 3, 6, 2, -1)
+        return self.scorer(features)
+
+    def score_direction_pairs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        fluency_mask: torch.Tensor,
+        verifier_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        features = self.direction_features(
+            input_ids, attention_mask, fluency_mask, verifier_mask
+        )
+        features = features.view(-1, 2, features.shape[-1])
+        return self.scorer(features[:, None, None, :, :]).view(-1)
+
+
+def sequence_verifier_inputs(
+    batch: dict[str, torch.Tensor], device: torch.device
+) -> dict[str, torch.Tensor]:
+    return {
+        key: batch[key].to(device, non_blocking=True)
+        for key in (
+            "input_ids",
+            "attention_mask",
+            "fluency_mask",
+            "verifier_mask",
+        )
+    }
+
+
+@torch.no_grad()
+def score_sequence_verifier(
+    model: TrainableSequenceVerifier,
     rows: list[SubwordRow],
     indices: Sequence[int],
     tokenizer: Tokenizer,
@@ -1550,26 +2107,148 @@ def score_causal_insertions(
         pin_memory=True,
         collate_fn=CausalScoreCollator(tokenizer.token_to_id("[PAD]")),
     )
-    directional = np.zeros((len(indices), 3, 6, 2, 3), dtype=np.float32)
+    scores = np.zeros((len(indices), 3, 6), dtype=np.float32)
     for batch in loader:
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         with autocast(device_type=device.type, dtype=torch.float16, enabled=True):
-            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-            token_log_probs = F.log_softmax(logits[:, :-1], dim=-1)
-            target_ids = input_ids[:, 1:]
-            selected = torch.gather(token_log_probs, 2, target_ids.unsqueeze(-1)).squeeze(-1)
-            component_scores = []
-            for key in ("total_mask", "boundary_mask", "fluency_mask"):
-                mask = batch[key][:, 1:].to(device, non_blocking=True)
-                component_scores.append(
-                    (selected * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+            batch_scores = model.score_direction_pairs(
+                **sequence_verifier_inputs(batch, device)
+            )
+        metadata = batch["metadata"].numpy()[::2]
+        for score, item_metadata in zip(
+            batch_scores.float().cpu().numpy(), metadata
+        ):
+            row, gap, candidate, _ = map(int, item_metadata)
+            scores[row, gap, candidate] = score
+    return scores
+
+
+def train_sequence_verifier(
+    language_model: GPT2LMHeadModel,
+    rows: list[SubwordRow],
+    indices: Sequence[int],
+    tokenizer: Tokenizer,
+    config: Config,
+    device: torch.device,
+    evaluation_rows: list[EncodedRow] | None = None,
+    validation_rows: list[SubwordRow] | None = None,
+    validation_indices: Sequence[int] | None = None,
+) -> tuple[TrainableSequenceVerifier, dict[str, float]]:
+    model = TrainableSequenceVerifier(
+        language_model, finetune_layers=config.finetune_layers
+    ).to(device)
+    loader = DataLoader(
+        LocalRowDataset(len(indices)),
+        batch_size=2,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        collate_fn=SequenceVerifierRowCollator(
+            rows, indices, tokenizer, config
+        ),
+    )
+    head_parameters = list(model.scorer.parameters())
+    transformer_parameters = [
+        parameter
+        for parameter in model.transformer.parameters()
+        if parameter.requires_grad
+    ]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": head_parameters, "lr": 5e-4},
+            {"params": transformer_parameters, "lr": 5e-5},
+        ],
+        weight_decay=0.03,
+        betas=(0.9, 0.98),
+    )
+    total_steps = config.finetune_epochs * len(loader)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: learning_rate_factor(step, total_steps, config.warmup_fraction),
+    )
+    scaler = GradScaler(device.type, enabled=True)
+    best_key = (-1.0, -1.0)
+    best_state: dict[str, torch.Tensor] | None = None
+    best_details: dict[str, float] = {}
+    for epoch in range(config.finetune_epochs):
+        model.train()
+        total_loss = 0.0
+        total_rows = 0
+        started = time.time()
+        for batch in loader:
+            optimizer.zero_grad(set_to_none=True)
+            pairs = batch["pairs"].to(device, non_blocking=True)
+            pair_targets = batch["pair_targets"].to(device, non_blocking=True)
+            permutation_targets = batch["permutation_targets"].to(
+                device, non_blocking=True
+            )
+            with autocast(device_type=device.type, dtype=torch.float16, enabled=True):
+                row_scores = model.score_rows(
+                    **sequence_verifier_inputs(batch, device),
+                    row_count=len(pairs),
                 )
-            scores = torch.stack(component_scores, dim=-1)
-        for score, metadata in zip(scores.float().cpu().numpy(), batch["metadata"].numpy()):
-            row, gap, candidate, direction = map(int, metadata)
-            directional[row, gap, candidate, direction, :] = score
-    return directional
+                pair_scores = torch_pair_scores(row_scores, pairs)
+                gap_loss = F.cross_entropy(
+                    pair_scores.reshape(-1, 3),
+                    pair_targets.reshape(-1),
+                    label_smoothing=0.05,
+                )
+                permutation_loss = F.cross_entropy(
+                    structured_pair_logits(pair_scores),
+                    permutation_targets,
+                    label_smoothing=0.05,
+                )
+                loss = gap_loss + permutation_loss
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(
+                list(model.scorer.parameters()) + transformer_parameters,
+                config.grad_clip,
+            )
+            previous_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            if scaler.get_scale() >= previous_scale:
+                scheduler.step()
+            count = len(pairs)
+            total_loss += float(loss.detach()) * count
+            total_rows += count
+        message: dict[str, float | int] = {
+            "sequence_verifier_epoch": epoch + 1,
+            "sequence_verifier_loss": total_loss / total_rows,
+            "seconds": time.time() - started,
+        }
+        if (
+            evaluation_rows is not None
+            and validation_rows is not None
+            and validation_indices is not None
+        ):
+            validation_scores = score_sequence_verifier(
+                model,
+                validation_rows,
+                validation_indices,
+                tokenizer,
+                config,
+                device,
+            )
+            details = evaluate_pair_mapping(
+                evaluation_rows, validation_indices, validation_scores
+            )
+            message.update(details)
+            key = (
+                details["verifier_pair_exact"],
+                details["verifier_pair_position"],
+            )
+            if key > best_key:
+                best_key = key
+                best_details = details
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                }
+        print(json.dumps(message, sort_keys=True), flush=True)
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, best_details
 
 
 def decode_row(
@@ -1609,6 +2288,8 @@ def decode_row(
 
 
 def meridian_components(prediction: Sequence[int], truth: Sequence[int]) -> dict[str, float]:
+    prediction = [int(value) for value in prediction]
+    truth = [int(value) for value in truth]
     position = sum(left == right for left, right in zip(prediction, truth)) / 3.0
     membership = len(set(prediction).intersection(truth)) / 3.0
     precedence_hits = 0
@@ -1636,6 +2317,36 @@ def evaluate_predictions(rows: list[EncodedRow], indices: Sequence[int], predict
     return {key: value / len(indices) for key, value in totals.items()}
 
 
+def valid_assignment_tensor(
+    rows: list[EncodedRow], indices: Sequence[int]
+) -> np.ndarray:
+    assignments: list[list[list[int]]] = []
+    for row_index in indices:
+        row_hypotheses: list[list[int]] = []
+        row = rows[int(row_index)]
+        for pair_order in permutations(range(3)):
+            ordered_pairs = [row.pairs[pair_index] for pair_index in pair_order]
+            for member_choices in product((0, 1), repeat=3):
+                row_hypotheses.append(
+                    [
+                        ordered_pairs[gap][member_choices[gap]]
+                        for gap in range(3)
+                    ]
+                )
+        assignments.append(row_hypotheses)
+    return np.asarray(assignments, dtype=np.int64)
+
+
+def decode_score_tensor(
+    scores: np.ndarray, assignments: np.ndarray
+) -> np.ndarray:
+    row_indices = np.arange(len(scores))[:, None, None]
+    gap_indices = np.arange(3)[None, None, :]
+    hypothesis_scores = scores[row_indices, gap_indices, assignments].sum(axis=-1)
+    winners = hypothesis_scores.argmax(axis=1)
+    return assignments[np.arange(len(assignments)), winners]
+
+
 def tune_and_evaluate(
     rows: list[EncodedRow],
     indices: Sequence[int],
@@ -1644,24 +2355,30 @@ def tune_and_evaluate(
     ngram_originality: np.ndarray | None = None,
 ) -> dict[str, float]:
     best: dict[str, float] | None = None
+    assignments = valid_assignment_tensor(rows, indices)
+    truths = [rows[int(row_index)].targets for row_index in indices]
+    assert all(truth is not None for truth in truths)
+    bridge = np.asarray(
+        [rows[int(row_index)].bridge_prior for row_index in indices],
+        dtype=np.float32,
+    )
     originality_weights = (0.0, 1.0, 2.0, 4.0, 8.0)
     ngram_weights = (0.0,) if ngram_originality is None else (0.0, 0.1, 0.25, 0.5, 1.0)
     bridge_weights = (0.0, 1.0, 2.0, 4.0, 8.0, 16.0)
     for weight in originality_weights:
         for ngram_weight in ngram_weights:
             for bridge_weight in bridge_weights:
-                predictions = [
-                    decode_row(
-                        rows[int(row_index)],
-                        compatibility[position],
-                        originality[position],
-                        float(weight),
-                        None if ngram_originality is None else ngram_originality[position],
-                        float(ngram_weight),
-                        float(bridge_weight),
+                stable_originality = weight * originality.mean(axis=1)
+                if ngram_originality is not None:
+                    stable_originality = (
+                        stable_originality + ngram_weight * ngram_originality
                     )
-                    for position, row_index in enumerate(indices)
-                ]
+                score_tensor = (
+                    compatibility
+                    + stable_originality[:, None, :]
+                    + bridge_weight * bridge
+                )
+                predictions = decode_score_tensor(score_tensor, assignments)
                 details = evaluate_predictions(rows, indices, predictions)
                 details["originality_weight"] = float(weight)
                 details["ngram_weight"] = float(ngram_weight)
@@ -1805,10 +2522,14 @@ def run_scratch_bert(
         tokenizer = train_subword_tokenizer(fitting_frame, config)
         evaluation_vocabulary, _ = build_vocabulary(fitting_frame, config)
         evaluation_rows = encode_frame(train_frame, evaluation_vocabulary, labelled=True)
-        raw_count_model = fit_raw_count_originality(evaluation_rows, train_indices, config.seed)
-        validation_ngram = score_raw_count_originality(
-            evaluation_rows, validation_indices, raw_count_model
-        )
+        validation_ngram: np.ndarray | None = None
+        if args.ngram_weight != 0.0:
+            raw_count_model = fit_raw_count_originality(
+                evaluation_rows, train_indices, config.seed
+            )
+            validation_ngram = score_raw_count_originality(
+                evaluation_rows, validation_indices, raw_count_model
+            )
         encoder = train_masked_language_encoder(fitting_frame, tokenizer, config, device)
         subword_rows = encode_subword_frame(train_frame, tokenizer, labelled=True)
         _, details = train_subword_ranker(
@@ -1879,8 +2600,18 @@ def run_causal_lm(
     config = Config(
         seed=args.seed,
         batch_size=args.batch_size,
+        left_tokens=args.context_tokens,
+        right_tokens=args.context_tokens,
+        mlm_length=args.sequence_length,
         causal_batch_size=args.batch_size,
         causal_epochs=args.causal_epochs,
+        causal_hidden_size=args.causal_hidden_size,
+        causal_layers=args.causal_layers,
+        causal_heads=args.causal_heads,
+        causal_inner_size=args.causal_inner_size,
+        verifier_epochs=args.verifier_epochs,
+        finetune_epochs=args.finetune_epochs,
+        finetune_layers=args.finetune_layers,
     )
     if args.mode == "validate":
         train_indices, validation_indices = grouped_split(
@@ -1901,29 +2632,109 @@ def run_causal_lm(
         tokenizer = train_subword_tokenizer(fitting_frame, config)
         evaluation_vocabulary, _ = build_vocabulary(fitting_frame, config)
         evaluation_rows = encode_frame(train_frame, evaluation_vocabulary, labelled=True)
-        raw_count_model = fit_raw_count_originality(evaluation_rows, train_indices, config.seed)
-        validation_ngram = score_raw_count_originality(
-            evaluation_rows, validation_indices, raw_count_model
-        )
+        validation_ngram: np.ndarray | None = None
+        if args.ngram_weight != 0.0:
+            raw_count_model = fit_raw_count_originality(
+                evaluation_rows, train_indices, config.seed
+            )
+            validation_ngram = score_raw_count_originality(
+                evaluation_rows, validation_indices, raw_count_model
+            )
         subword_rows = encode_subword_frame(train_frame, tokenizer, labelled=True)
         directional_sum = np.zeros((len(validation_indices), 3, 6, 2, 3), dtype=np.float32)
+        verifier_kinds = (
+            ("linear", "tiny", "mlp")
+            if args.verifier_kind == "all"
+            else (args.verifier_kind,)
+        )
+        verifier_sums = {
+            kind: np.zeros((len(validation_indices), 3, 6), dtype=np.float32)
+            for kind in verifier_kinds
+        }
         for ensemble_index in range(args.ensemble):
             seed_everything(config.seed + 1009 * ensemble_index)
             language_model = train_bidirectional_causal_lm(
                 fitting_frame, tokenizer, config, device
             )
-            directional_sum += score_causal_insertions(
-                language_model,
-                subword_rows,
-                validation_indices,
-                tokenizer,
-                config,
-                device,
-            )
+            if args.verifier_kind == "finetune":
+                validation_directional = score_causal_insertions(
+                    language_model,
+                    subword_rows,
+                    validation_indices,
+                    tokenizer,
+                    config,
+                    device,
+                )
+                directional_sum += validation_directional
+                verifier, _ = train_sequence_verifier(
+                    language_model,
+                    subword_rows,
+                    train_indices,
+                    tokenizer,
+                    config,
+                    device,
+                    evaluation_rows=evaluation_rows,
+                    validation_rows=subword_rows,
+                    validation_indices=validation_indices,
+                )
+                verifier_scores = score_sequence_verifier(
+                    verifier,
+                    subword_rows,
+                    validation_indices,
+                    tokenizer,
+                    config,
+                    device,
+                )
+                verifier_sums["finetune"] += pair_average_scores(
+                    evaluation_rows, validation_indices, verifier_scores
+                )
+                del verifier, verifier_scores
+            else:
+                _, fitting_features = score_causal_insertions(
+                    language_model,
+                    subword_rows,
+                    train_indices,
+                    tokenizer,
+                    config,
+                    device,
+                    return_features=True,
+                )
+                validation_directional, validation_features = score_causal_insertions(
+                    language_model,
+                    subword_rows,
+                    validation_indices,
+                    tokenizer,
+                    config,
+                    device,
+                    return_features=True,
+                )
+                directional_sum += validation_directional
+                for verifier_kind in verifier_kinds:
+                    verifier, _ = train_coherence_verifier(
+                        fitting_features,
+                        evaluation_rows,
+                        train_indices,
+                        config,
+                        device,
+                        validation_features=validation_features,
+                        validation_indices=validation_indices,
+                        kind=verifier_kind,
+                    )
+                    verifier_scores = score_coherence_verifier(
+                        verifier, validation_features, device
+                    )
+                    verifier_sums[verifier_kind] += pair_average_scores(
+                        evaluation_rows, validation_indices, verifier_scores
+                    )
+                    del verifier, verifier_scores
+                del fitting_features, validation_features
             del language_model
             torch.cuda.empty_cache()
         directional_sum /= args.ensemble
+        for verifier_kind in verifier_kinds:
+            verifier_sums[verifier_kind] /= args.ensemble
         details: dict[str, float] | None = None
+        best_compatibility: np.ndarray | None = None
         for forward_weight in (0.5, 0.75, 1.0):
             direction_mix = (
                 forward_weight * directional_sum[..., 0, :]
@@ -1945,7 +2756,31 @@ def run_causal_lm(
                 candidate["boundary_weight"] = float(boundary_weight)
                 if details is None or candidate["meridian"] > details["meridian"]:
                     details = candidate
+                    best_compatibility = compatibility
         assert details is not None
+        assert best_compatibility is not None
+        for verifier_kind in verifier_kinds:
+            for verifier_weight in (0.05, 0.10, 0.25, 0.50, 1.0, 2.0, 4.0):
+                candidate = tune_and_evaluate(
+                    evaluation_rows,
+                    validation_indices,
+                    best_compatibility
+                    + verifier_weight * verifier_sums[verifier_kind],
+                    (
+                        details["forward_weight"] * directional_sum[..., 0, 2]
+                        + (1.0 - details["forward_weight"])
+                        * directional_sum[..., 1, 2]
+                    ),
+                    ngram_originality=validation_ngram,
+                )
+                candidate["forward_weight"] = details["forward_weight"]
+                candidate["boundary_weight"] = details["boundary_weight"]
+                candidate["verifier_kind"] = verifier_kind
+                candidate["verifier_weight"] = float(verifier_weight)
+                if candidate["meridian"] > details["meridian"]:
+                    details = candidate
+        details.setdefault("verifier_weight", 0.0)
+        details.setdefault("verifier_kind", "none")
         print(json.dumps({"best_validation": details}, sort_keys=True), flush=True)
         return
 
@@ -1968,16 +2803,79 @@ def run_causal_lm(
             evaluation_test_rows, test_indices, raw_count_model
         )
     subword_test_rows = encode_subword_frame(test_frame, tokenizer, labelled=False)
+    subword_train_rows = encode_subword_frame(train_frame, tokenizer, labelled=True)
     directional_sum = np.zeros((len(test_indices), 3, 6, 2, 3), dtype=np.float32)
+    verifier_sum = np.zeros((len(test_indices), 3, 6), dtype=np.float32)
     for ensemble_index in range(args.ensemble):
         seed_everything(config.seed + 1009 * ensemble_index)
         language_model = train_bidirectional_causal_lm(train_frame, tokenizer, config, device)
-        directional_sum += score_causal_insertions(
-            language_model, subword_test_rows, test_indices, tokenizer, config, device
-        )
-        del language_model
+        if args.verifier_kind == "finetune":
+            verifier, _ = train_sequence_verifier(
+                language_model,
+                subword_train_rows,
+                train_indices,
+                tokenizer,
+                config,
+                device,
+            )
+            test_directional = score_causal_insertions(
+                language_model,
+                subword_test_rows,
+                test_indices,
+                tokenizer,
+                config,
+                device,
+            )
+            verifier_scores = score_sequence_verifier(
+                verifier,
+                subword_test_rows,
+                test_indices,
+                tokenizer,
+                config,
+                device,
+            )
+            directional_sum += test_directional
+            verifier_sum += pair_average_scores(
+                evaluation_test_rows, test_indices, verifier_scores
+            )
+            del language_model, verifier, verifier_scores
+        else:
+            _, fitting_features = score_causal_insertions(
+                language_model,
+                subword_train_rows,
+                train_indices,
+                tokenizer,
+                config,
+                device,
+                return_features=True,
+            )
+            verifier, _ = train_coherence_verifier(
+                fitting_features,
+                evaluation_train_rows,
+                train_indices,
+                config,
+                device,
+                kind=args.verifier_kind,
+            )
+            test_directional, test_features = score_causal_insertions(
+                language_model,
+                subword_test_rows,
+                test_indices,
+                tokenizer,
+                config,
+                device,
+                return_features=True,
+            )
+            directional_sum += test_directional
+            verifier_sum += pair_average_scores(
+                evaluation_test_rows,
+                test_indices,
+                score_coherence_verifier(verifier, test_features, device),
+            )
+            del language_model, verifier, fitting_features, test_features
         torch.cuda.empty_cache()
     directional_sum /= args.ensemble
+    verifier_sum /= args.ensemble
     direction_mix = (
         args.forward_weight * directional_sum[..., 0, :]
         + (1.0 - args.forward_weight) * directional_sum[..., 1, :]
@@ -1985,6 +2883,7 @@ def run_causal_lm(
     compatibility = (
         (1.0 - args.boundary_weight) * direction_mix[..., 0]
         + args.boundary_weight * direction_mix[..., 1]
+        + args.verifier_weight * verifier_sum
     )
     write_submission(
         args.submission_out,
@@ -2008,15 +2907,34 @@ def parse_args() -> argparse.Namespace:
         "--architecture", choices=("causal-lm", "scratch-bert", "hybrid"), default="causal-lm"
     )
     parser.add_argument("--epochs", type=int, default=Config.epochs)
-    parser.add_argument("--ensemble", type=int, default=2)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--ensemble", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=40)
+    parser.add_argument("--context-tokens", type=int, default=Config.left_tokens)
+    parser.add_argument("--sequence-length", type=int, default=Config.mlm_length)
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--originality-weight", type=float, default=4.0)
     parser.add_argument("--ngram-weight", type=float, default=0.0)
-    parser.add_argument("--bridge-weight", type=float, default=1.0)
+    parser.add_argument("--bridge-weight", type=float, default=2.0)
     parser.add_argument("--mlm-epochs", type=int, default=Config.mlm_epochs)
     parser.add_argument("--causal-epochs", type=int, default=Config.causal_epochs)
-    parser.add_argument("--forward-weight", type=float, default=0.75)
+    parser.add_argument(
+        "--causal-hidden-size", type=int, default=Config.causal_hidden_size
+    )
+    parser.add_argument("--causal-layers", type=int, default=Config.causal_layers)
+    parser.add_argument("--causal-heads", type=int, default=Config.causal_heads)
+    parser.add_argument(
+        "--causal-inner-size", type=int, default=Config.causal_inner_size
+    )
+    parser.add_argument("--verifier-epochs", type=int, default=Config.verifier_epochs)
+    parser.add_argument("--finetune-epochs", type=int, default=Config.finetune_epochs)
+    parser.add_argument("--finetune-layers", type=int, default=Config.finetune_layers)
+    parser.add_argument("--verifier-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--verifier-kind",
+        choices=("linear", "tiny", "mlp", "all", "finetune"),
+        default="finetune",
+    )
+    parser.add_argument("--forward-weight", type=float, default=0.5)
     parser.add_argument("--boundary-weight", type=float, default=0.75)
     return parser.parse_args()
 
