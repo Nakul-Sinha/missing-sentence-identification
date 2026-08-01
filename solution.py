@@ -40,7 +40,7 @@ from tokenizers import Tokenizer
 from tokenizers import models as tokenizer_models
 from tokenizers import pre_tokenizers as tokenizer_pre_tokenizers
 from tokenizers import trainers as tokenizer_trainers
-from transformers import BertConfig, BertForMaskedLM, BertModel
+from transformers import BertConfig, BertForMaskedLM, BertModel, GPT2Config, GPT2LMHeadModel
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 
@@ -82,6 +82,8 @@ class Config:
     mlm_epochs: int = 5
     mlm_batch_size: int = 64
     rank_batch_size: int = 12
+    causal_epochs: int = 8
+    causal_batch_size: int = 64
 
     @property
     def max_length(self) -> int:
@@ -1319,6 +1321,219 @@ def train_subword_ranker(
     return model, best_details
 
 
+class CausalSequenceDataset(Dataset[list[int]]):
+    def __init__(self, sequences: list[list[int]]):
+        self.sequences = sequences
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, index: int) -> list[int]:
+        return self.sequences[index]
+
+
+class CausalTrainCollator:
+    def __init__(self, pad_id: int):
+        self.pad_id = pad_id
+
+    def __call__(self, sequences: Sequence[list[int]]) -> dict[str, torch.Tensor]:
+        max_length = max(map(len, sequences))
+        input_ids = torch.full((len(sequences), max_length), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        for index, sequence in enumerate(sequences):
+            input_ids[index, : len(sequence)] = torch.tensor(sequence, dtype=torch.long)
+            attention_mask[index, : len(sequence)] = True
+        labels = input_ids.clone()
+        labels[~attention_mask] = -100
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+
+def train_bidirectional_causal_lm(
+    frame: pd.DataFrame,
+    tokenizer: Tokenizer,
+    config: Config,
+    device: torch.device,
+) -> GPT2LMHeadModel:
+    forward_id = tokenizer.token_to_id("[CLS]")
+    reverse_id = tokenizer.token_to_id("[MASK]")
+    sep_id = tokenizer.token_to_id("[SEP]")
+    sequences: list[list[int]] = []
+    for text in original_training_excerpts(frame):
+        content = tokenizer.encode(text, add_special_tokens=False).ids[: config.mlm_length - 2]
+        sequences.append([forward_id] + content + [sep_id])
+        sequences.append([reverse_id] + list(reversed(content)) + [sep_id])
+    loader = DataLoader(
+        CausalSequenceDataset(sequences),
+        batch_size=config.causal_batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        collate_fn=CausalTrainCollator(tokenizer.token_to_id("[PAD]")),
+    )
+    model_config = GPT2Config(
+        vocab_size=tokenizer.get_vocab_size(),
+        n_positions=config.mlm_length,
+        n_ctx=config.mlm_length,
+        n_embd=256,
+        n_layer=4,
+        n_head=8,
+        n_inner=768,
+        resid_pdrop=0.10,
+        embd_pdrop=0.10,
+        attn_pdrop=0.10,
+        bos_token_id=forward_id,
+        eos_token_id=sep_id,
+        pad_token_id=tokenizer.token_to_id("[PAD]"),
+        use_cache=False,
+    )
+    model = GPT2LMHeadModel(model_config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=4e-4, weight_decay=0.01, betas=(0.9, 0.98))
+    total_steps = config.causal_epochs * len(loader)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda step: learning_rate_factor(step, total_steps, config.warmup_fraction)
+    )
+    scaler = GradScaler(device.type, enabled=True)
+    for epoch in range(config.causal_epochs):
+        model.train()
+        total_loss = 0.0
+        total_examples = 0
+        started = time.time()
+        for batch in loader:
+            optimizer.zero_grad(set_to_none=True)
+            batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+            with autocast(device_type=device.type, dtype=torch.float16, enabled=True):
+                loss = model(**batch).loss
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            count = batch["input_ids"].shape[0]
+            total_loss += float(loss.detach()) * count
+            total_examples += count
+        print(
+            json.dumps(
+                {
+                    "causal_epoch": epoch + 1,
+                    "causal_loss": total_loss / total_examples,
+                    "seconds": time.time() - started,
+                }
+            ),
+            flush=True,
+        )
+    return model
+
+
+class CausalScoringDataset(Dataset[tuple[list[int], list[bool], int, int, int, int]]):
+    def __init__(
+        self,
+        rows: list[SubwordRow],
+        indices: Sequence[int],
+        tokenizer: Tokenizer,
+        config: Config,
+    ):
+        self.rows = rows
+        self.indices = [int(index) for index in indices]
+        self.forward_id = tokenizer.token_to_id("[CLS]")
+        self.reverse_id = tokenizer.token_to_id("[MASK]")
+        self.sep_id = tokenizer.token_to_id("[SEP]")
+        self.config = config
+
+    def __len__(self) -> int:
+        return len(self.indices) * 3 * 6 * 2
+
+    def __getitem__(self, index: int) -> tuple[list[int], list[bool], int, int, int, int]:
+        direction = index % 2
+        base = index // 2
+        candidate_index = base % 6
+        gap_index = (base // 6) % 3
+        local_row = base // 18
+        row_index = self.indices[local_row]
+        row = self.rows[row_index]
+        candidate = row.candidates[candidate_index][: self.config.candidate_tokens]
+        if direction == 0:
+            left = row.left[gap_index][-self.config.left_tokens :]
+            right = row.right[gap_index][:32]
+            sequence = [self.forward_id] + left + candidate + right + [self.sep_id]
+            score_mask = (
+                [False] * (1 + len(left))
+                + [True] * len(candidate)
+                + [True] * min(16, len(right))
+                + [False] * (len(right) - min(16, len(right)) + 1)
+            )
+        else:
+            right = list(reversed(row.right[gap_index][: self.config.right_tokens]))
+            reversed_candidate = list(reversed(candidate))
+            left = list(reversed(row.left[gap_index][-32:]))
+            sequence = [self.reverse_id] + right + reversed_candidate + left + [self.sep_id]
+            score_mask = (
+                [False] * (1 + len(right))
+                + [True] * len(reversed_candidate)
+                + [True] * min(16, len(left))
+                + [False] * (len(left) - min(16, len(left)) + 1)
+            )
+        return sequence, score_mask, local_row, gap_index, candidate_index, direction
+
+
+class CausalScoreCollator:
+    def __init__(self, pad_id: int):
+        self.pad_id = pad_id
+
+    def __call__(self, items: Sequence[tuple[list[int], list[bool], int, int, int, int]]) -> dict[str, torch.Tensor]:
+        max_length = max(len(item[0]) for item in items)
+        input_ids = torch.full((len(items), max_length), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        score_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        metadata = torch.zeros((len(items), 4), dtype=torch.long)
+        for index, (sequence, mask, row, gap, candidate, direction) in enumerate(items):
+            input_ids[index, : len(sequence)] = torch.tensor(sequence)
+            attention_mask[index, : len(sequence)] = True
+            score_mask[index, : len(mask)] = torch.tensor(mask)
+            metadata[index] = torch.tensor([row, gap, candidate, direction])
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "score_mask": score_mask,
+            "metadata": metadata,
+        }
+
+
+@torch.no_grad()
+def score_causal_insertions(
+    model: GPT2LMHeadModel,
+    rows: list[SubwordRow],
+    indices: Sequence[int],
+    tokenizer: Tokenizer,
+    config: Config,
+    device: torch.device,
+) -> np.ndarray:
+    model.eval()
+    loader = DataLoader(
+        CausalScoringDataset(rows, indices, tokenizer, config),
+        batch_size=64,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        collate_fn=CausalScoreCollator(tokenizer.token_to_id("[PAD]")),
+    )
+    directional = np.zeros((len(indices), 3, 6, 2), dtype=np.float32)
+    for batch in loader:
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        with autocast(device_type=device.type, dtype=torch.float16, enabled=True):
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            token_log_probs = F.log_softmax(logits[:, :-1], dim=-1)
+            target_ids = input_ids[:, 1:]
+            selected = torch.gather(token_log_probs, 2, target_ids.unsqueeze(-1)).squeeze(-1)
+            mask = batch["score_mask"][:, 1:].to(device, non_blocking=True)
+            scores = (selected * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+        for score, metadata in zip(scores.float().cpu().numpy(), batch["metadata"].numpy()):
+            row, gap, candidate, direction = map(int, metadata)
+            directional[row, gap, candidate, direction] = score
+    return directional.mean(axis=-1)
+
+
 def decode_row(
     row: EncodedRow,
     compatibility: np.ndarray,
@@ -1611,11 +1826,98 @@ def run_scratch_bert(
     print(json.dumps({"submission": str(args.output), "rows": len(test_frame)}), flush=True)
 
 
+def run_causal_lm(
+    args: argparse.Namespace,
+    train_frame: pd.DataFrame,
+    data_dir: Path,
+    device: torch.device,
+) -> None:
+    config = Config(
+        seed=args.seed,
+        batch_size=args.batch_size,
+        causal_batch_size=args.batch_size,
+        causal_epochs=args.causal_epochs,
+    )
+    if args.mode == "validate":
+        train_indices, validation_indices = grouped_split(
+            train_frame, config.validation_fraction, config.seed
+        )
+        fitting_frame = train_frame.iloc[train_indices].reset_index(drop=True)
+        print(
+            json.dumps(
+                {
+                    "architecture": "causal-lm",
+                    "train_rows": len(train_indices),
+                    "validation_rows": len(validation_indices),
+                    "config": asdict(config),
+                }
+            ),
+            flush=True,
+        )
+        tokenizer = train_subword_tokenizer(fitting_frame, config)
+        evaluation_vocabulary, _ = build_vocabulary(fitting_frame, config)
+        evaluation_rows = encode_frame(train_frame, evaluation_vocabulary, labelled=True)
+        raw_count_model = fit_raw_count_originality(evaluation_rows, train_indices, config.seed)
+        validation_ngram = score_raw_count_originality(
+            evaluation_rows, validation_indices, raw_count_model
+        )
+        subword_rows = encode_subword_frame(train_frame, tokenizer, labelled=True)
+        language_model = train_bidirectional_causal_lm(
+            fitting_frame, tokenizer, config, device
+        )
+        compatibility = score_causal_insertions(
+            language_model,
+            subword_rows,
+            validation_indices,
+            tokenizer,
+            config,
+            device,
+        )
+        originality = np.zeros_like(compatibility)
+        details = tune_and_evaluate(
+            evaluation_rows,
+            validation_indices,
+            compatibility,
+            originality,
+            ngram_originality=validation_ngram,
+        )
+        print(json.dumps({"best_validation": details}, sort_keys=True), flush=True)
+        return
+
+    test_frame = pd.read_csv(data_dir / "test.csv")
+    tokenizer = train_subword_tokenizer(train_frame, config)
+    evaluation_vocabulary, _ = build_vocabulary(train_frame, config)
+    evaluation_train_rows = encode_frame(train_frame, evaluation_vocabulary, labelled=True)
+    evaluation_test_rows = encode_frame(test_frame, evaluation_vocabulary, labelled=False)
+    train_indices = np.arange(len(train_frame), dtype=np.int64)
+    test_indices = np.arange(len(test_frame), dtype=np.int64)
+    raw_count_model = fit_raw_count_originality(evaluation_train_rows, train_indices, config.seed)
+    test_ngram = score_raw_count_originality(evaluation_test_rows, test_indices, raw_count_model)
+    subword_test_rows = encode_subword_frame(test_frame, tokenizer, labelled=False)
+    language_model = train_bidirectional_causal_lm(train_frame, tokenizer, config, device)
+    compatibility = score_causal_insertions(
+        language_model, subword_test_rows, test_indices, tokenizer, config, device
+    )
+    write_submission(
+        args.output,
+        evaluation_test_rows,
+        compatibility,
+        np.zeros_like(compatibility),
+        0.0,
+        test_ngram,
+        args.ngram_weight,
+        args.bridge_weight,
+    )
+    print(json.dumps({"submission": str(args.output), "rows": len(test_frame)}), flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("validate", "train-predict"), nargs="?", default="train-predict")
     parser.add_argument("--data-dir", type=Path, default=Path("dataset"))
-    parser.add_argument("--architecture", choices=("scratch-bert", "hybrid"), default="scratch-bert")
+    parser.add_argument(
+        "--architecture", choices=("causal-lm", "scratch-bert", "hybrid"), default="hybrid"
+    )
     parser.add_argument("--output", type=Path, default=Path("working/submission.csv"))
     parser.add_argument("--epochs", type=int, default=Config.epochs)
     parser.add_argument("--ensemble", type=int, default=2)
@@ -1625,6 +1927,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ngram-weight", type=float, default=0.5)
     parser.add_argument("--bridge-weight", type=float, default=4.0)
     parser.add_argument("--mlm-epochs", type=int, default=Config.mlm_epochs)
+    parser.add_argument("--causal-epochs", type=int, default=Config.causal_epochs)
     return parser.parse_args()
 
 
@@ -1640,6 +1943,9 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("The challenge requires a GPU for the primary sequence model, but CUDA is unavailable.")
     device = torch.device("cuda")
+    if args.architecture == "causal-lm":
+        run_causal_lm(args, train_frame, data_dir, device)
+        return
     if args.architecture == "scratch-bert":
         run_scratch_bert(args, train_frame, data_dir, device)
         return
