@@ -1425,7 +1425,9 @@ def train_bidirectional_causal_lm(
     return model
 
 
-class CausalScoringDataset(Dataset[tuple[list[int], list[bool], int, int, int, int]]):
+class CausalScoringDataset(
+    Dataset[tuple[list[int], list[bool], list[bool], list[bool], int, int, int, int]]
+):
     def __init__(
         self,
         rows: list[SubwordRow],
@@ -1443,7 +1445,9 @@ class CausalScoringDataset(Dataset[tuple[list[int], list[bool], int, int, int, i
     def __len__(self) -> int:
         return len(self.indices) * 3 * 6 * 2
 
-    def __getitem__(self, index: int) -> tuple[list[int], list[bool], int, int, int, int]:
+    def __getitem__(
+        self, index: int
+    ) -> tuple[list[int], list[bool], list[bool], list[bool], int, int, int, int]:
         direction = index % 2
         base = index // 2
         candidate_index = base % 6
@@ -1456,45 +1460,98 @@ class CausalScoringDataset(Dataset[tuple[list[int], list[bool], int, int, int, i
             left = row.left[gap_index][-self.config.left_tokens :]
             right = row.right[gap_index][:32]
             sequence = [self.forward_id] + left + candidate + right + [self.sep_id]
-            score_mask = (
+            total_mask = (
                 [False] * (1 + len(left))
                 + [True] * len(candidate)
                 + [True] * min(16, len(right))
                 + [False] * (len(right) - min(16, len(right)) + 1)
+            )
+            boundary_mask = (
+                [False] * (1 + len(left))
+                + [True] * min(16, len(candidate))
+                + [False] * (len(candidate) - min(16, len(candidate)))
+                + [True] * min(16, len(right))
+                + [False] * (len(right) - min(16, len(right)) + 1)
+            )
+            fluency_mask = (
+                [False] * (1 + len(left))
+                + [True] * len(candidate)
+                + [False] * (len(right) + 1)
             )
         else:
             right = list(reversed(row.right[gap_index][: self.config.right_tokens]))
             reversed_candidate = list(reversed(candidate))
             left = list(reversed(row.left[gap_index][-32:]))
             sequence = [self.reverse_id] + right + reversed_candidate + left + [self.sep_id]
-            score_mask = (
+            total_mask = (
                 [False] * (1 + len(right))
                 + [True] * len(reversed_candidate)
                 + [True] * min(16, len(left))
                 + [False] * (len(left) - min(16, len(left)) + 1)
             )
-        return sequence, score_mask, local_row, gap_index, candidate_index, direction
+            boundary_mask = (
+                [False] * (1 + len(right))
+                + [True] * min(16, len(reversed_candidate))
+                + [False] * (len(reversed_candidate) - min(16, len(reversed_candidate)))
+                + [True] * min(16, len(left))
+                + [False] * (len(left) - min(16, len(left)) + 1)
+            )
+            fluency_mask = (
+                [False] * (1 + len(right))
+                + [True] * len(reversed_candidate)
+                + [False] * (len(left) + 1)
+            )
+        return (
+            sequence,
+            total_mask,
+            boundary_mask,
+            fluency_mask,
+            local_row,
+            gap_index,
+            candidate_index,
+            direction,
+        )
 
 
 class CausalScoreCollator:
     def __init__(self, pad_id: int):
         self.pad_id = pad_id
 
-    def __call__(self, items: Sequence[tuple[list[int], list[bool], int, int, int, int]]) -> dict[str, torch.Tensor]:
+    def __call__(
+        self,
+        items: Sequence[
+            tuple[list[int], list[bool], list[bool], list[bool], int, int, int, int]
+        ],
+    ) -> dict[str, torch.Tensor]:
         max_length = max(len(item[0]) for item in items)
         input_ids = torch.full((len(items), max_length), self.pad_id, dtype=torch.long)
         attention_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        score_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        total_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        boundary_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        fluency_mask = torch.zeros_like(input_ids, dtype=torch.bool)
         metadata = torch.zeros((len(items), 4), dtype=torch.long)
-        for index, (sequence, mask, row, gap, candidate, direction) in enumerate(items):
+        for index, (
+            sequence,
+            total,
+            boundary,
+            fluency,
+            row,
+            gap,
+            candidate,
+            direction,
+        ) in enumerate(items):
             input_ids[index, : len(sequence)] = torch.tensor(sequence)
             attention_mask[index, : len(sequence)] = True
-            score_mask[index, : len(mask)] = torch.tensor(mask)
+            total_mask[index, : len(total)] = torch.tensor(total)
+            boundary_mask[index, : len(boundary)] = torch.tensor(boundary)
+            fluency_mask[index, : len(fluency)] = torch.tensor(fluency)
             metadata[index] = torch.tensor([row, gap, candidate, direction])
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "score_mask": score_mask,
+            "total_mask": total_mask,
+            "boundary_mask": boundary_mask,
+            "fluency_mask": fluency_mask,
             "metadata": metadata,
         }
 
@@ -1517,7 +1574,7 @@ def score_causal_insertions(
         pin_memory=True,
         collate_fn=CausalScoreCollator(tokenizer.token_to_id("[PAD]")),
     )
-    directional = np.zeros((len(indices), 3, 6, 2), dtype=np.float32)
+    directional = np.zeros((len(indices), 3, 6, 2, 3), dtype=np.float32)
     for batch in loader:
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
@@ -1526,11 +1583,16 @@ def score_causal_insertions(
             token_log_probs = F.log_softmax(logits[:, :-1], dim=-1)
             target_ids = input_ids[:, 1:]
             selected = torch.gather(token_log_probs, 2, target_ids.unsqueeze(-1)).squeeze(-1)
-            mask = batch["score_mask"][:, 1:].to(device, non_blocking=True)
-            scores = (selected * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+            component_scores = []
+            for key in ("total_mask", "boundary_mask", "fluency_mask"):
+                mask = batch[key][:, 1:].to(device, non_blocking=True)
+                component_scores.append(
+                    (selected * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+                )
+            scores = torch.stack(component_scores, dim=-1)
         for score, metadata in zip(scores.float().cpu().numpy(), batch["metadata"].numpy()):
             row, gap, candidate, direction = map(int, metadata)
-            directional[row, gap, candidate, direction] = score
+            directional[row, gap, candidate, direction, :] = score
     return directional
 
 
@@ -1862,7 +1924,7 @@ def run_causal_lm(
             evaluation_rows, validation_indices, raw_count_model
         )
         subword_rows = encode_subword_frame(train_frame, tokenizer, labelled=True)
-        directional_sum = np.zeros((len(validation_indices), 3, 6, 2), dtype=np.float32)
+        directional_sum = np.zeros((len(validation_indices), 3, 6, 2, 3), dtype=np.float32)
         for ensemble_index in range(args.ensemble):
             seed_everything(config.seed + 1009 * ensemble_index)
             language_model = train_bidirectional_causal_lm(
@@ -1880,21 +1942,27 @@ def run_causal_lm(
             torch.cuda.empty_cache()
         directional_sum /= args.ensemble
         details: dict[str, float] | None = None
-        for forward_weight in (0.0, 0.25, 0.5, 0.75, 1.0):
-            compatibility = (
-                forward_weight * directional_sum[..., 0]
-                + (1.0 - forward_weight) * directional_sum[..., 1]
+        for forward_weight in (0.5, 0.75, 1.0):
+            direction_mix = (
+                forward_weight * directional_sum[..., 0, :]
+                + (1.0 - forward_weight) * directional_sum[..., 1, :]
             )
-            candidate = tune_and_evaluate(
-                evaluation_rows,
-                validation_indices,
-                compatibility,
-                np.zeros_like(compatibility),
-                ngram_originality=validation_ngram,
-            )
-            candidate["forward_weight"] = float(forward_weight)
-            if details is None or candidate["meridian"] > details["meridian"]:
-                details = candidate
+            for boundary_weight in (0.25, 0.5, 0.75, 1.0):
+                compatibility = (
+                    (1.0 - boundary_weight) * direction_mix[..., 0]
+                    + boundary_weight * direction_mix[..., 1]
+                )
+                candidate = tune_and_evaluate(
+                    evaluation_rows,
+                    validation_indices,
+                    compatibility,
+                    direction_mix[..., 2],
+                    ngram_originality=validation_ngram,
+                )
+                candidate["forward_weight"] = float(forward_weight)
+                candidate["boundary_weight"] = float(boundary_weight)
+                if details is None or candidate["meridian"] > details["meridian"]:
+                    details = candidate
         assert details is not None
         print(json.dumps({"best_validation": details}, sort_keys=True), flush=True)
         return
@@ -1909,7 +1977,7 @@ def run_causal_lm(
     raw_count_model = fit_raw_count_originality(evaluation_train_rows, train_indices, config.seed)
     test_ngram = score_raw_count_originality(evaluation_test_rows, test_indices, raw_count_model)
     subword_test_rows = encode_subword_frame(test_frame, tokenizer, labelled=False)
-    directional_sum = np.zeros((len(test_indices), 3, 6, 2), dtype=np.float32)
+    directional_sum = np.zeros((len(test_indices), 3, 6, 2, 3), dtype=np.float32)
     for ensemble_index in range(args.ensemble):
         seed_everything(config.seed + 1009 * ensemble_index)
         language_model = train_bidirectional_causal_lm(train_frame, tokenizer, config, device)
@@ -1919,16 +1987,20 @@ def run_causal_lm(
         del language_model
         torch.cuda.empty_cache()
     directional_sum /= args.ensemble
+    direction_mix = (
+        args.forward_weight * directional_sum[..., 0, :]
+        + (1.0 - args.forward_weight) * directional_sum[..., 1, :]
+    )
     compatibility = (
-        args.forward_weight * directional_sum[..., 0]
-        + (1.0 - args.forward_weight) * directional_sum[..., 1]
+        (1.0 - args.boundary_weight) * direction_mix[..., 0]
+        + args.boundary_weight * direction_mix[..., 1]
     )
     write_submission(
         args.output,
         evaluation_test_rows,
         compatibility,
-        np.zeros_like(compatibility),
-        0.0,
+        direction_mix[..., 2],
+        args.originality_weight,
         test_ngram,
         args.ngram_weight,
         args.bridge_weight,
@@ -1954,6 +2026,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlm-epochs", type=int, default=Config.mlm_epochs)
     parser.add_argument("--causal-epochs", type=int, default=Config.causal_epochs)
     parser.add_argument("--forward-weight", type=float, default=0.5)
+    parser.add_argument("--boundary-weight", type=float, default=0.5)
     return parser.parse_args()
 
 
