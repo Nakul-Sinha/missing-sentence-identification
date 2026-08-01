@@ -36,6 +36,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.linear_model import SGDClassifier
+from tokenizers import Tokenizer
+from tokenizers import models as tokenizer_models
+from tokenizers import pre_tokenizers as tokenizer_pre_tokenizers
+from tokenizers import trainers as tokenizer_trainers
+from transformers import BertConfig, BertForMaskedLM, BertModel
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 
@@ -72,6 +77,11 @@ class Config:
     pair_loss_weight: float = 1.0
     validation_fraction: float = 0.15
     num_workers: int = 0
+    subword_vocab_size: int = 8_000
+    mlm_length: int = 192
+    mlm_epochs: int = 5
+    mlm_batch_size: int = 64
+    rank_batch_size: int = 12
 
     @property
     def max_length(self) -> int:
@@ -869,6 +879,432 @@ def score_raw_count_originality(
     return scores.reshape(len(indices), 6)
 
 
+def train_subword_tokenizer(frame: pd.DataFrame, config: Config) -> Tokenizer:
+    """Train byte-BPE only on the supplied labelled-training subset."""
+    tokenizer = Tokenizer(tokenizer_models.BPE(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = tokenizer_pre_tokenizers.ByteLevel(add_prefix_space=False)
+    trainer = tokenizer_trainers.BpeTrainer(
+        vocab_size=config.subword_vocab_size,
+        min_frequency=2,
+        special_tokens=["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"],
+        show_progress=False,
+    )
+
+    def iterator() -> Iterable[str]:
+        for row in frame.itertuples(index=False):
+            for gap_index in range(1, 4):
+                yield getattr(row, f"gap_{gap_index}")
+            for text in parse_candidates(row.candidates).values():
+                yield text
+
+    tokenizer.train_from_iterator(iterator(), trainer=trainer)
+    return tokenizer
+
+
+def original_training_excerpts(frame: pd.DataFrame) -> Iterable[str]:
+    """Yield five-sentence original excerpts; counterfeits are excluded."""
+    for row in frame.itertuples(index=False):
+        candidates = parse_candidates(row.candidates)
+        binding = str(row.binding).split(">")
+        for gap_index, letter in enumerate(binding, start=1):
+            left, right = split_gap(getattr(row, f"gap_{gap_index}"))
+            yield f"{left} {candidates[letter]} {right}"
+
+
+class MLMDataset(Dataset[list[int]]):
+    def __init__(self, sequences: list[list[int]]):
+        self.sequences = sequences
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, index: int) -> list[int]:
+        return self.sequences[index]
+
+
+class MLMCollator:
+    def __init__(self, tokenizer: Tokenizer, config: Config):
+        self.pad_id = tokenizer.token_to_id("[PAD]")
+        self.mask_id = tokenizer.token_to_id("[MASK]")
+        self.vocabulary_size = tokenizer.get_vocab_size()
+        self.special_ids = torch.tensor(
+            [tokenizer.token_to_id(token) for token in ("[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]")],
+            dtype=torch.long,
+        )
+        self.config = config
+
+    def __call__(self, sequences: Sequence[list[int]]) -> dict[str, torch.Tensor]:
+        max_length = min(self.config.mlm_length, max(len(sequence) for sequence in sequences))
+        input_ids = torch.full((len(sequences), max_length), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        for index, sequence in enumerate(sequences):
+            length = min(len(sequence), max_length)
+            input_ids[index, :length] = torch.tensor(sequence[:length], dtype=torch.long)
+            attention_mask[index, :length] = True
+        labels = input_ids.clone()
+        special_mask = (input_ids[..., None] == self.special_ids).any(dim=-1)
+        selected = (torch.rand(input_ids.shape) < 0.15) & attention_mask & ~special_mask
+        labels[~selected] = -100
+        replacement_draw = torch.rand(input_ids.shape)
+        mask_replacement = selected & (replacement_draw < 0.80)
+        random_replacement = selected & (replacement_draw >= 0.80) & (replacement_draw < 0.90)
+        input_ids[mask_replacement] = self.mask_id
+        random_tokens = torch.randint(5, self.vocabulary_size, input_ids.shape)
+        input_ids[random_replacement] = random_tokens[random_replacement]
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+
+def train_masked_language_encoder(
+    frame: pd.DataFrame,
+    tokenizer: Tokenizer,
+    config: Config,
+    device: torch.device,
+) -> BertModel:
+    cls_id = tokenizer.token_to_id("[CLS]")
+    sep_id = tokenizer.token_to_id("[SEP]")
+    sequences = []
+    for text in original_training_excerpts(frame):
+        content = tokenizer.encode(text, add_special_tokens=False).ids[: config.mlm_length - 2]
+        sequences.append([cls_id] + content + [sep_id])
+    loader = DataLoader(
+        MLMDataset(sequences),
+        batch_size=config.mlm_batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        collate_fn=MLMCollator(tokenizer, config),
+    )
+    bert_config = BertConfig(
+        vocab_size=tokenizer.get_vocab_size(),
+        hidden_size=256,
+        num_hidden_layers=4,
+        num_attention_heads=8,
+        intermediate_size=768,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.10,
+        attention_probs_dropout_prob=0.10,
+        max_position_embeddings=256,
+        type_vocab_size=2,
+        pad_token_id=tokenizer.token_to_id("[PAD]"),
+        bos_token_id=cls_id,
+        eos_token_id=sep_id,
+    )
+    model = BertForMaskedLM(bert_config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01, betas=(0.9, 0.98))
+    total_steps = config.mlm_epochs * len(loader)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: learning_rate_factor(step, total_steps, config.warmup_fraction),
+    )
+    scaler = GradScaler(device.type, enabled=True)
+    for epoch in range(config.mlm_epochs):
+        model.train()
+        total_loss = 0.0
+        total_examples = 0
+        started = time.time()
+        for batch in loader:
+            optimizer.zero_grad(set_to_none=True)
+            batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+            with autocast(device_type=device.type, dtype=torch.float16, enabled=True):
+                loss = model(**batch).loss
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            count = batch["input_ids"].shape[0]
+            total_loss += float(loss.detach()) * count
+            total_examples += count
+        print(
+            json.dumps(
+                {
+                    "mlm_epoch": epoch + 1,
+                    "mlm_loss": total_loss / total_examples,
+                    "seconds": time.time() - started,
+                }
+            ),
+            flush=True,
+        )
+    encoder = model.bert
+    del model.cls
+    return encoder
+
+
+@dataclass
+class SubwordRow:
+    row_id: int
+    left: list[list[int]]
+    right: list[list[int]]
+    candidates: list[list[int]]
+    pairs: list[tuple[int, int]]
+    targets: list[int] | None
+    originals: list[float] | None
+
+
+def encode_subword_frame(frame: pd.DataFrame, tokenizer: Tokenizer, labelled: bool) -> list[SubwordRow]:
+    result: list[SubwordRow] = []
+    for row in frame.itertuples(index=False):
+        parsed = parse_candidates(row.candidates)
+        left_parts: list[list[int]] = []
+        right_parts: list[list[int]] = []
+        for gap_index in range(1, 4):
+            left, right = split_gap(getattr(row, f"gap_{gap_index}"))
+            left_parts.append(tokenizer.encode(left, add_special_tokens=False).ids)
+            right_parts.append(tokenizer.encode(right, add_special_tokens=False).ids)
+        candidate_parts = [tokenizer.encode(parsed[letter], add_special_tokens=False).ids for letter in LETTERS]
+        targets = None
+        originals = None
+        if labelled:
+            binding = str(row.binding).split(">")
+            targets = [LETTERS.index(letter) for letter in binding]
+            originals = [float(letter in set(binding)) for letter in LETTERS]
+        result.append(
+            SubwordRow(
+                row_id=int(row.id),
+                left=left_parts,
+                right=right_parts,
+                candidates=candidate_parts,
+                pairs=candidate_pairs(parsed),
+                targets=targets,
+                originals=originals,
+            )
+        )
+    return result
+
+
+class SubwordBatchBuilder:
+    def __init__(self, rows: list[SubwordRow], tokenizer: Tokenizer, config: Config, labelled: bool):
+        self.rows = rows
+        self.cls_id = tokenizer.token_to_id("[CLS]")
+        self.sep_id = tokenizer.token_to_id("[SEP]")
+        self.pad_id = tokenizer.token_to_id("[PAD]")
+        self.config = config
+        self.labelled = labelled
+
+    def __call__(self, items: Sequence[tuple[int, int]]) -> dict[str, torch.Tensor]:
+        sequences: list[list[int]] = []
+        types: list[list[int]] = []
+        candidate_masks: list[list[bool]] = []
+        targets: list[int] = []
+        originals: list[list[float]] = []
+        pairs: list[list[tuple[int, int]]] = []
+        pair_targets: list[int] = []
+        row_indices: list[int] = []
+        gap_indices: list[int] = []
+        for row_index, gap_index in items:
+            row = self.rows[row_index]
+            left = row.left[gap_index][-self.config.left_tokens :]
+            right = row.right[gap_index][: self.config.right_tokens]
+            for candidate in row.candidates:
+                candidate = candidate[: self.config.candidate_tokens]
+                sequence = [self.cls_id] + left + [self.sep_id] + candidate + [self.sep_id] + right + [self.sep_id]
+                token_types = [0] * (len(left) + 2) + [1] * (len(candidate) + 1) + [0] * (len(right) + 1)
+                candidate_mask = [False] * (len(left) + 2) + [True] * len(candidate) + [False] * (len(right) + 2)
+                sequences.append(sequence)
+                types.append(token_types)
+                candidate_masks.append(candidate_mask)
+            if self.labelled:
+                assert row.targets is not None and row.originals is not None
+                target = row.targets[gap_index]
+                targets.append(target)
+                originals.append(row.originals)
+                pairs.append(row.pairs)
+                pair_targets.append(next(index for index, pair in enumerate(row.pairs) if target in pair))
+            row_indices.append(row_index)
+            gap_indices.append(gap_index)
+        max_length = max(map(len, sequences))
+        input_ids = torch.full((len(sequences), max_length), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(sequences), max_length), dtype=torch.bool)
+        token_type_ids = torch.zeros((len(sequences), max_length), dtype=torch.long)
+        candidate_mask_tensor = torch.zeros((len(sequences), max_length), dtype=torch.bool)
+        for index, (sequence, token_types, candidate_mask) in enumerate(zip(sequences, types, candidate_masks)):
+            length = len(sequence)
+            input_ids[index, :length] = torch.tensor(sequence)
+            attention_mask[index, :length] = True
+            token_type_ids[index, :length] = torch.tensor(token_types)
+            candidate_mask_tensor[index, :length] = torch.tensor(candidate_mask)
+        output = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+            "candidate_mask": candidate_mask_tensor,
+            "row_indices": torch.tensor(row_indices, dtype=torch.long),
+            "gap_indices": torch.tensor(gap_indices, dtype=torch.long),
+        }
+        if self.labelled:
+            output["targets"] = torch.tensor(targets, dtype=torch.long)
+            output["originals"] = torch.tensor(originals, dtype=torch.float32)
+            output["pairs"] = torch.tensor(pairs, dtype=torch.long)
+            output["pair_targets"] = torch.tensor(pair_targets, dtype=torch.long)
+        return output
+
+
+class BertBridgeRanker(nn.Module):
+    def __init__(self, encoder: BertModel):
+        super().__init__()
+        self.encoder = encoder
+        hidden = encoder.config.hidden_size
+        self.compatibility_head = nn.Sequential(
+            nn.LayerNorm(hidden * 2), nn.Linear(hidden * 2, hidden), nn.GELU(), nn.Dropout(0.1), nn.Linear(hidden, 1)
+        )
+        self.originality_head = nn.Sequential(
+            nn.LayerNorm(hidden), nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(0.1), nn.Linear(hidden, 1)
+        )
+        self.compatibility_head.apply(CoherenceTransformer._initialize)
+        self.originality_head.apply(CoherenceTransformer._initialize)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+        ).last_hidden_state
+        weights = candidate_mask.unsqueeze(-1).to(hidden.dtype)
+        candidate_pool = (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        cls_pool = hidden[:, 0]
+        compatibility = self.compatibility_head(torch.cat([cls_pool, candidate_pool], dim=-1)).squeeze(-1)
+        originality = self.originality_head(candidate_pool).squeeze(-1)
+        return compatibility, originality
+
+
+def make_subword_loader(
+    rows: list[SubwordRow],
+    indices: Sequence[int],
+    tokenizer: Tokenizer,
+    config: Config,
+    labelled: bool,
+    shuffle: bool,
+) -> DataLoader:
+    return DataLoader(
+        GapDataset(indices),
+        batch_size=config.rank_batch_size,
+        shuffle=shuffle,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        collate_fn=SubwordBatchBuilder(rows, tokenizer, config, labelled),
+    )
+
+
+def move_subword_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+    return {
+        key: batch[key].to(device, non_blocking=True)
+        for key in ("input_ids", "attention_mask", "token_type_ids", "candidate_mask")
+    }
+
+
+@torch.no_grad()
+def score_subword_rows(
+    model: BertBridgeRanker,
+    rows: list[SubwordRow],
+    indices: Sequence[int],
+    tokenizer: Tokenizer,
+    config: Config,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    loader = make_subword_loader(rows, indices, tokenizer, config, labelled=False, shuffle=False)
+    local_position = {int(row_index): position for position, row_index in enumerate(indices)}
+    compatibility_scores = np.zeros((len(indices), 3, 6), dtype=np.float32)
+    originality_scores = np.zeros((len(indices), 3, 6), dtype=np.float32)
+    for batch in loader:
+        with autocast(device_type=device.type, dtype=torch.float16, enabled=True):
+            compatibility, originality = model(**move_subword_batch(batch, device))
+        compatibility = compatibility.view(-1, 6).float().cpu().numpy()
+        originality = originality.view(-1, 6).float().cpu().numpy()
+        for batch_index, (row_index, gap_index) in enumerate(
+            zip(batch["row_indices"].numpy(), batch["gap_indices"].numpy())
+        ):
+            position = local_position[int(row_index)]
+            compatibility_scores[position, int(gap_index)] = compatibility[batch_index]
+            originality_scores[position, int(gap_index)] = originality[batch_index]
+    return compatibility_scores, originality_scores
+
+
+def train_subword_ranker(
+    rows: list[SubwordRow],
+    train_indices: Sequence[int],
+    tokenizer: Tokenizer,
+    encoder: BertModel,
+    config: Config,
+    device: torch.device,
+    evaluation_rows: list[EncodedRow] | None = None,
+    validation_indices: Sequence[int] | None = None,
+    validation_ngram: np.ndarray | None = None,
+) -> tuple[BertBridgeRanker, dict[str, float]]:
+    model = BertBridgeRanker(encoder).to(device)
+    loader = make_subword_loader(rows, train_indices, tokenizer, config, labelled=True, shuffle=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.02, betas=(0.9, 0.98))
+    total_steps = config.epochs * len(loader)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda step: learning_rate_factor(step, total_steps, config.warmup_fraction)
+    )
+    scaler = GradScaler(device.type, enabled=True)
+    best_score = -1.0
+    best_details: dict[str, float] = {}
+    best_state: dict[str, torch.Tensor] | None = None
+    for epoch in range(config.epochs):
+        model.train()
+        total_loss = 0.0
+        total_groups = 0
+        started = time.time()
+        for batch in loader:
+            optimizer.zero_grad(set_to_none=True)
+            targets = batch["targets"].to(device, non_blocking=True)
+            originals = batch["originals"].to(device, non_blocking=True)
+            pairs = batch["pairs"].to(device, non_blocking=True)
+            pair_targets = batch["pair_targets"].to(device, non_blocking=True)
+            with autocast(device_type=device.type, dtype=torch.float16, enabled=True):
+                compatibility, originality = model(**move_subword_batch(batch, device))
+                compatibility = compatibility.view(-1, 6)
+                originality = originality.view(-1, 6)
+                rank_loss = F.cross_entropy(compatibility + originality, targets)
+                pair_logits = torch.gather(compatibility[:, None, :].expand(-1, 3, -1), 2, pairs).mean(dim=-1)
+                pair_loss = F.cross_entropy(pair_logits, pair_targets)
+                originality_loss = F.binary_cross_entropy_with_logits(originality, originals)
+                loss = rank_loss + pair_loss + originality_loss
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            count = targets.numel()
+            total_loss += float(loss.detach()) * count
+            total_groups += count
+        message: dict[str, float | int] = {
+            "rank_epoch": epoch + 1,
+            "rank_loss": total_loss / total_groups,
+            "seconds": time.time() - started,
+        }
+        if validation_indices is not None and evaluation_rows is not None:
+            compatibility_scores, originality_scores = score_subword_rows(
+                model, rows, validation_indices, tokenizer, config, device
+            )
+            details = tune_and_evaluate(
+                evaluation_rows,
+                validation_indices,
+                compatibility_scores,
+                originality_scores,
+                ngram_originality=validation_ngram,
+            )
+            message.update(details)
+            if details["meridian"] > best_score:
+                best_score = details["meridian"]
+                best_details = details
+                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+        print(json.dumps(message, sort_keys=True), flush=True)
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, best_details
+
+
 def decode_row(
     row: EncodedRow,
     compatibility: np.ndarray,
@@ -1059,10 +1495,101 @@ def validate_submission(submission: pd.DataFrame, rows: list[EncodedRow]) -> Non
             raise ValueError(f"Invalid binding: {binding}")
 
 
+def run_scratch_bert(
+    args: argparse.Namespace,
+    train_frame: pd.DataFrame,
+    data_dir: Path,
+    device: torch.device,
+) -> None:
+    config = Config(
+        seed=args.seed,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        rank_batch_size=args.batch_size,
+        mlm_epochs=args.mlm_epochs,
+    )
+    if args.mode == "validate":
+        train_indices, validation_indices = grouped_split(
+            train_frame, config.validation_fraction, config.seed
+        )
+        fitting_frame = train_frame.iloc[train_indices].reset_index(drop=True)
+        print(
+            json.dumps(
+                {
+                    "architecture": "scratch-bert",
+                    "train_rows": len(train_indices),
+                    "validation_rows": len(validation_indices),
+                    "config": asdict(config),
+                }
+            ),
+            flush=True,
+        )
+        tokenizer = train_subword_tokenizer(fitting_frame, config)
+        evaluation_vocabulary, _ = build_vocabulary(fitting_frame, config)
+        evaluation_rows = encode_frame(train_frame, evaluation_vocabulary, labelled=True)
+        raw_count_model = fit_raw_count_originality(evaluation_rows, train_indices, config.seed)
+        validation_ngram = score_raw_count_originality(
+            evaluation_rows, validation_indices, raw_count_model
+        )
+        encoder = train_masked_language_encoder(fitting_frame, tokenizer, config, device)
+        subword_rows = encode_subword_frame(train_frame, tokenizer, labelled=True)
+        _, details = train_subword_ranker(
+            subword_rows,
+            train_indices,
+            tokenizer,
+            encoder,
+            config,
+            device,
+            evaluation_rows=evaluation_rows,
+            validation_indices=validation_indices,
+            validation_ngram=validation_ngram,
+        )
+        print(json.dumps({"best_validation": details}, sort_keys=True), flush=True)
+        return
+
+    test_frame = pd.read_csv(data_dir / "test.csv")
+    expected_test_columns = ["id", "gap_1", "gap_2", "gap_3", "candidates"]
+    if list(test_frame.columns) != expected_test_columns:
+        raise ValueError(f"Unexpected test columns: {list(test_frame.columns)}")
+    tokenizer = train_subword_tokenizer(train_frame, config)
+    evaluation_vocabulary, _ = build_vocabulary(train_frame, config)
+    evaluation_train_rows = encode_frame(train_frame, evaluation_vocabulary, labelled=True)
+    evaluation_test_rows = encode_frame(test_frame, evaluation_vocabulary, labelled=False)
+    train_indices = np.arange(len(train_frame), dtype=np.int64)
+    test_indices = np.arange(len(test_frame), dtype=np.int64)
+    raw_count_model = fit_raw_count_originality(evaluation_train_rows, train_indices, config.seed)
+    test_ngram = score_raw_count_originality(evaluation_test_rows, test_indices, raw_count_model)
+    encoder = train_masked_language_encoder(train_frame, tokenizer, config, device)
+    subword_train_rows = encode_subword_frame(train_frame, tokenizer, labelled=True)
+    subword_test_rows = encode_subword_frame(test_frame, tokenizer, labelled=False)
+    model, _ = train_subword_ranker(
+        subword_train_rows,
+        train_indices,
+        tokenizer,
+        encoder,
+        config,
+        device,
+    )
+    compatibility, originality = score_subword_rows(
+        model, subword_test_rows, test_indices, tokenizer, config, device
+    )
+    write_submission(
+        args.output,
+        evaluation_test_rows,
+        compatibility,
+        originality,
+        args.originality_weight,
+        test_ngram,
+        args.ngram_weight,
+    )
+    print(json.dumps({"submission": str(args.output), "rows": len(test_frame)}), flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("validate", "train-predict"), nargs="?", default="train-predict")
     parser.add_argument("--data-dir", type=Path, default=Path("dataset"))
+    parser.add_argument("--architecture", choices=("scratch-bert", "hybrid"), default="scratch-bert")
     parser.add_argument("--output", type=Path, default=Path("working/submission.csv"))
     parser.add_argument("--epochs", type=int, default=Config.epochs)
     parser.add_argument("--ensemble", type=int, default=2)
@@ -1070,6 +1597,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--originality-weight", type=float, default=1.0)
     parser.add_argument("--ngram-weight", type=float, default=0.5)
+    parser.add_argument("--mlm-epochs", type=int, default=Config.mlm_epochs)
     return parser.parse_args()
 
 
@@ -1082,11 +1610,14 @@ def main() -> None:
     expected_train_columns = ["id", "gap_1", "gap_2", "gap_3", "candidates", "binding"]
     if list(train_frame.columns) != expected_train_columns:
         raise ValueError(f"Unexpected train columns: {list(train_frame.columns)}")
-    vocabulary, id_to_token = build_vocabulary(train_frame, config)
-    print(json.dumps({"config": asdict(config), "device": "cuda" if torch.cuda.is_available() else "cpu", "vocabulary": len(vocabulary)}))
     if not torch.cuda.is_available():
         raise RuntimeError("The challenge requires a GPU for the primary sequence model, but CUDA is unavailable.")
     device = torch.device("cuda")
+    if args.architecture == "scratch-bert":
+        run_scratch_bert(args, train_frame, data_dir, device)
+        return
+    vocabulary, id_to_token = build_vocabulary(train_frame, config)
+    print(json.dumps({"config": asdict(config), "device": "cuda", "vocabulary": len(vocabulary)}))
     train_rows = encode_frame(train_frame, vocabulary, labelled=True)
 
     if args.mode == "validate":
