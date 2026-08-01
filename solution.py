@@ -4,15 +4,13 @@ The model is a compact Transformer encoder initialized randomly and trained only
 on train.csv.  Test text is tokenized with the frozen train vocabulary and is
 never used for fitting, model selection, or early stopping.
 
-Examples
---------
-Honest grouped validation::
+Platform invocation::
 
-    python solution.py validate --epochs 6
+    python3 solution.py <public_dir> <submission_out>
 
-Train on every labelled row and create ./working/submission.csv::
+Honest grouped validation for development::
 
-    python solution.py train-predict --epochs 6 --ensemble 2
+    python solution.py dataset/public working/validation.csv --mode validate --ensemble 1
 """
 
 from __future__ import annotations
@@ -141,28 +139,6 @@ def candidate_pairs(candidates: dict[str, str]) -> list[tuple[int, int]]:
     if len(pairs) != 3 or any(len(pair) != 2 for pair in pairs):
         raise ValueError("Expected exactly three same-token candidate pairs.")
     return [(int(pair[0]), int(pair[1])) for pair in pairs]
-
-
-def locate_data_dir(requested: Path) -> Path:
-    if (requested / "train.csv").is_file() and (requested / "test.csv").is_file():
-        return requested
-    roots = [Path("dataset"), Path("input"), Path("/kaggle/input"), Path("/kaggle/working/dataset")]
-    matches: list[Path] = []
-    for root in roots:
-        if not root.exists():
-            continue
-        if (root / "train.csv").is_file() and (root / "test.csv").is_file():
-            matches.append(root)
-        if root == Path("/kaggle/input"):
-            for train_path in root.rglob("train.csv"):
-                if (train_path.parent / "test.csv").is_file():
-                    matches.append(train_path.parent)
-    matches = list(dict.fromkeys(path.resolve() for path in matches))
-    if len(matches) != 1:
-        raise FileNotFoundError(
-            f"Could not uniquely locate train.csv and test.csv; pass --data-dir. Found: {matches}"
-        )
-    return matches[0]
 
 
 def build_vocabulary(frame: pd.DataFrame, config: Config) -> tuple[dict[str, int], list[str]]:
@@ -1882,7 +1858,7 @@ def run_scratch_bert(
         model, subword_test_rows, test_indices, tokenizer, config, device
     )
     write_submission(
-        args.output,
+        args.submission_out,
         evaluation_test_rows,
         compatibility,
         originality,
@@ -1891,7 +1867,7 @@ def run_scratch_bert(
         args.ngram_weight,
         args.bridge_weight,
     )
-    print(json.dumps({"submission": str(args.output), "rows": len(test_frame)}), flush=True)
+    print(json.dumps({"submission": str(args.submission_out), "rows": len(test_frame)}), flush=True)
 
 
 def run_causal_lm(
@@ -2011,7 +1987,7 @@ def run_causal_lm(
         + args.boundary_weight * direction_mix[..., 1]
     )
     write_submission(
-        args.output,
+        args.submission_out,
         evaluation_test_rows,
         compatibility,
         direction_mix[..., 2],
@@ -2020,17 +1996,17 @@ def run_causal_lm(
         args.ngram_weight,
         args.bridge_weight,
     )
-    print(json.dumps({"submission": str(args.output), "rows": len(test_frame)}), flush=True)
+    print(json.dumps({"submission": str(args.submission_out), "rows": len(test_frame)}), flush=True)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("validate", "train-predict"), nargs="?", default="train-predict")
-    parser.add_argument("--data-dir", type=Path, default=Path("dataset"))
+    parser.add_argument("public_dir", type=Path)
+    parser.add_argument("submission_out", type=Path)
+    parser.add_argument("--mode", choices=("validate", "train-predict"), default="train-predict")
     parser.add_argument(
         "--architecture", choices=("causal-lm", "scratch-bert", "hybrid"), default="causal-lm"
     )
-    parser.add_argument("--output", type=Path, default=Path("working/submission.csv"))
     parser.add_argument("--epochs", type=int, default=Config.epochs)
     parser.add_argument("--ensemble", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -2049,7 +2025,7 @@ def main() -> None:
     args = parse_args()
     config = Config(seed=args.seed, epochs=args.epochs, batch_size=args.batch_size)
     seed_everything(config.seed)
-    data_dir = locate_data_dir(args.data_dir)
+    data_dir = args.public_dir
     train_frame = pd.read_csv(data_dir / "train.csv")
     expected_train_columns = ["id", "gap_1", "gap_2", "gap_3", "candidates", "binding"]
     if list(train_frame.columns) != expected_train_columns:
@@ -2107,7 +2083,7 @@ def main() -> None:
     compatibility_sum /= args.ensemble
     originality_sum /= args.ensemble
     write_submission(
-        args.output,
+        args.submission_out,
         test_rows,
         compatibility_sum,
         originality_sum,
@@ -2116,7 +2092,7 @@ def main() -> None:
         args.ngram_weight,
         args.bridge_weight,
     )
-    print(json.dumps({"submission": str(args.output), "rows": len(test_rows)}))
+    print(json.dumps({"submission": str(args.submission_out), "rows": len(test_rows)}))
 
 
 if __name__ == "__main__":
