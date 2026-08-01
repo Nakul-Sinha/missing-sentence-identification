@@ -51,6 +51,9 @@ The default T4 configuration trains two seeded models and writes exactly:
 working/submission.csv
 ```
 
+The final offline Kaggle T4 production run completed in 1,336 seconds
+(approximately 22.3 minutes), including full test scoring.
+
 For the leakage-safe validation used above:
 
 ```bash
