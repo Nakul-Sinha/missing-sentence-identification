@@ -1,4 +1,4 @@
-# Meridian Ashes - Missing Sentence Identification
+# Missing Sentence Identification: technical notes
 
 Offline, from-scratch solution for the Meridian Ashes challenge.
 
