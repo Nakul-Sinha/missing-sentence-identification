@@ -1531,7 +1531,7 @@ def score_causal_insertions(
         for score, metadata in zip(scores.float().cpu().numpy(), batch["metadata"].numpy()):
             row, gap, candidate, direction = map(int, metadata)
             directional[row, gap, candidate, direction] = score
-    return directional.mean(axis=-1)
+    return directional
 
 
 def decode_row(
@@ -1862,25 +1862,40 @@ def run_causal_lm(
             evaluation_rows, validation_indices, raw_count_model
         )
         subword_rows = encode_subword_frame(train_frame, tokenizer, labelled=True)
-        language_model = train_bidirectional_causal_lm(
-            fitting_frame, tokenizer, config, device
-        )
-        compatibility = score_causal_insertions(
-            language_model,
-            subword_rows,
-            validation_indices,
-            tokenizer,
-            config,
-            device,
-        )
-        originality = np.zeros_like(compatibility)
-        details = tune_and_evaluate(
-            evaluation_rows,
-            validation_indices,
-            compatibility,
-            originality,
-            ngram_originality=validation_ngram,
-        )
+        directional_sum = np.zeros((len(validation_indices), 3, 6, 2), dtype=np.float32)
+        for ensemble_index in range(args.ensemble):
+            seed_everything(config.seed + 1009 * ensemble_index)
+            language_model = train_bidirectional_causal_lm(
+                fitting_frame, tokenizer, config, device
+            )
+            directional_sum += score_causal_insertions(
+                language_model,
+                subword_rows,
+                validation_indices,
+                tokenizer,
+                config,
+                device,
+            )
+            del language_model
+            torch.cuda.empty_cache()
+        directional_sum /= args.ensemble
+        details: dict[str, float] | None = None
+        for forward_weight in (0.0, 0.25, 0.5, 0.75, 1.0):
+            compatibility = (
+                forward_weight * directional_sum[..., 0]
+                + (1.0 - forward_weight) * directional_sum[..., 1]
+            )
+            candidate = tune_and_evaluate(
+                evaluation_rows,
+                validation_indices,
+                compatibility,
+                np.zeros_like(compatibility),
+                ngram_originality=validation_ngram,
+            )
+            candidate["forward_weight"] = float(forward_weight)
+            if details is None or candidate["meridian"] > details["meridian"]:
+                details = candidate
+        assert details is not None
         print(json.dumps({"best_validation": details}, sort_keys=True), flush=True)
         return
 
@@ -1894,9 +1909,19 @@ def run_causal_lm(
     raw_count_model = fit_raw_count_originality(evaluation_train_rows, train_indices, config.seed)
     test_ngram = score_raw_count_originality(evaluation_test_rows, test_indices, raw_count_model)
     subword_test_rows = encode_subword_frame(test_frame, tokenizer, labelled=False)
-    language_model = train_bidirectional_causal_lm(train_frame, tokenizer, config, device)
-    compatibility = score_causal_insertions(
-        language_model, subword_test_rows, test_indices, tokenizer, config, device
+    directional_sum = np.zeros((len(test_indices), 3, 6, 2), dtype=np.float32)
+    for ensemble_index in range(args.ensemble):
+        seed_everything(config.seed + 1009 * ensemble_index)
+        language_model = train_bidirectional_causal_lm(train_frame, tokenizer, config, device)
+        directional_sum += score_causal_insertions(
+            language_model, subword_test_rows, test_indices, tokenizer, config, device
+        )
+        del language_model
+        torch.cuda.empty_cache()
+    directional_sum /= args.ensemble
+    compatibility = (
+        args.forward_weight * directional_sum[..., 0]
+        + (1.0 - args.forward_weight) * directional_sum[..., 1]
     )
     write_submission(
         args.output,
@@ -1928,6 +1953,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bridge-weight", type=float, default=4.0)
     parser.add_argument("--mlm-epochs", type=int, default=Config.mlm_epochs)
     parser.add_argument("--causal-epochs", type=int, default=Config.causal_epochs)
+    parser.add_argument("--forward-weight", type=float, default=0.5)
     return parser.parse_args()
 
 
